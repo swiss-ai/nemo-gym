@@ -197,6 +197,13 @@ class RunHelper:  # pragma: no cover
             if "entrypoint" not in server_config_dict:
                 continue
 
+            # An explicit `url` marks a remote server (e.g. behind a TLS
+            # ingress): keep it in the config so refs/validation resolve, but
+            # never spawn it locally — ServerClient calls the url directly.
+            if "url" in server_config_dict:
+                print(f"Skipping local spawn of '{top_level_path}': remote server at {server_config_dict.url}")
+                continue
+
             # TODO: This currently only handles relative entrypoints. Later on we can resolve the absolute path.
             entrypoint_fpath = Path(server_config_dict.entrypoint)
             assert not entrypoint_fpath.is_absolute()

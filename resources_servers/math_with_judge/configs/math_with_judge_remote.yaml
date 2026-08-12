@@ -1,12 +1,14 @@
 # Remote variant: use the math_with_judge verifier already running on
 # breithorn k8s (rob-poc GitOps) instead of spawning one per training job.
 #
-# No `entrypoint` on the resources server -> the launcher does not spawn it;
-# `url` -> ServerClient talks to it directly (TLS ingress, source-whitelisted).
+# `url` marks the server as remote: it stays in the config (entrypoint is
+# required for schema/ref validation) but the launcher skips spawning it and
+# ServerClient talks to the url directly (TLS ingress, source-whitelisted).
 # The agent still runs locally next to the policy model server.
 math_with_judge:
   resources_servers:
     math_with_judge:
+      entrypoint: app.py
       url: https://nemo-gym-math-dev.swissai.svc.cscs.ch
       host: nemo-gym-math-dev.swissai.svc.cscs.ch
       port: 443
