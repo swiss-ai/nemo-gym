@@ -5,6 +5,7 @@ on:
     branches: [swissai-k8s]
     paths:
       - docker/**
+      - .dockerignore
       - .github/workflows/build-resources-server.yml
       - nemo_gym/**
       - resources_servers/math_with_judge/**
