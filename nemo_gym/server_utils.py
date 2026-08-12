@@ -322,6 +322,13 @@ class ServerClient(BaseModel):
         return cls(head_server_config=head_server_config, global_config_dict=global_config_dict)
 
     def _build_server_base_url(self, server_config_dict: OmegaConf) -> str:
+        # A server entry may declare an explicit `url` (e.g. an already-running
+        # remote server behind TLS/an ingress, which http://host:port can't
+        # express). Entries without an `entrypoint` are never spawned locally,
+        # so url + no entrypoint = "use this remote server as-is".
+        url = server_config_dict.get("url")
+        if url:
+            return str(url).rstrip("/")
         return f"http://{server_config_dict.host}:{server_config_dict.port}"
 
     async def request(
