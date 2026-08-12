@@ -1,0 +1,38 @@
+# Standalone NeMo Gym resources server for Kubernetes.
+#
+# Runs one resources server (default: math_with_judge) exactly the way the
+# `gym env start` launcher spawns it — plain `python app.py` from the server
+# directory — but with the config supplied via environment variables instead
+# of a launcher process:
+#
+#   NEMO_GYM_CONFIG_DICT  full global-config YAML (from a ConfigMap)
+#   NEMO_GYM_CONFIG_PATH  top-level config key naming this server
+#
+# No head server, no per-boot venv builds, no judge model required
+# (should_use_judge: false in the shipped config). Ray still initialises a
+# local instance in-process; give the pod a real /dev/shm (emptyDir medium:
+# Memory) and ~2Gi of headroom.
+ARG SERVER=math_with_judge
+
+FROM python:3.12-slim
+ARG SERVER
+
+# git: pip editable-install metadata; build-essential: sdist fallbacks
+# (e.g. yappi has no aarch64 wheel and compiles from source).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git build-essential curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY . /app
+
+# Same dependency set the launcher's per-server venv gets: the gym package
+# with dev extras, plus the server's own requirements (minus its editable
+# self-reference back to ../../).
+RUN pip install --no-cache-dir -e ".[dev]" \
+    && grep -vE '^\s*(-e|#|$)' "resources_servers/${SERVER}/requirements.txt" \
+       | xargs -r pip install --no-cache-dir
+
+ENV NEMO_GYM_CONFIG_PATH=${SERVER}
+WORKDIR /app/resources_servers/${SERVER}
+CMD ["python", "app.py"]
