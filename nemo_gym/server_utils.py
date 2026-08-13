@@ -35,6 +35,7 @@ import ray
 import requests
 import uvicorn
 from aiohttp import (
+    ClientError,
     ClientOSError,
     ClientResponse,
     ClientResponseError,
@@ -342,7 +343,25 @@ class ServerClient(BaseModel):
             if isinstance(json_obj, BaseModel):
                 kwargs["json"] = json_obj.model_dump(exclude_unset=True)
 
-        return await request(method=method, url=f"{base_url}{url_path}", _internal=True, **kwargs)
+        # Remote servers (see `url` in _build_server_base_url) live behind
+        # ingresses whose pods can be OOM-killed, rescheduled, or scaled down
+        # mid-request. A single transient 5xx/connection error must not kill a
+        # whole training run, so retry idempotent gym calls with backoff.
+        last_exc: Optional[Exception] = None
+        for attempt in range(4):
+            if attempt:
+                await asyncio.sleep(min(2**attempt, 8))
+            try:
+                res = await request(method=method, url=f"{base_url}{url_path}", _internal=True, **kwargs)
+            except ClientError as e:
+                last_exc = e
+                continue
+            if res.status < 500 or attempt == 3:
+                return res
+            print(
+                f"Got HTTP {res.status} from {server_name}{url_path} (attempt {attempt + 1}/4), retrying..."
+            )
+        raise last_exc  # only reachable when every attempt raised ClientError
 
     async def get(
         self,
