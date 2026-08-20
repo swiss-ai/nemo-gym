@@ -1,0 +1,32 @@
+# Remote variant: use the blackjack env already running on breithorn k8s
+# (rob-poc GitOps) instead of spawning it in the training job. `url` + kept
+# `entrypoint` = registered for validation/refs but never spawned locally
+# (see ServerClient/_build_server_base_url and the launcher's url skip).
+# The gymnasium_agent threads the session cookie per episode, so stateful
+# reset/step works across the TLS gateway unchanged.
+blackjack:
+  resources_servers:
+    blackjack:
+      entrypoint: app.py
+      url: https://gym-dev.swissai.svc.cscs.ch/blackjack
+      host: gym-dev.swissai.svc.cscs.ch
+      port: 443
+      domain: games
+      verified: false
+      description: Blackjack. Model hits or stands. Reward +1 win, 0 draw, -1 loss/bust.
+      value: Example gymnasium-style multi-step environment, served remotely
+blackjack_gymnasium_agent:
+  responses_api_agents:
+    gymnasium_agent:
+      entrypoint: app.py
+      resources_server:
+        type: resources_servers
+        name: blackjack
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      max_steps: 5
+      datasets:
+      - name: example
+        type: example
+        jsonl_fpath: resources_servers/blackjack/data/example.jsonl
