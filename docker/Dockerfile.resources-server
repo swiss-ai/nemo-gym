@@ -34,5 +34,8 @@ RUN pip install --no-cache-dir -e ".[dev]" \
        | xargs -r pip install --no-cache-dir
 
 ENV NEMO_GYM_CONFIG_PATH=${SERVER}
+# Servers may import sibling packages (e.g. blackjack imports
+# resources_servers.gymnasium), which requires the repo root on sys.path.
+ENV PYTHONPATH=/app
 WORKDIR /app/resources_servers/${SERVER}
 CMD ["python", "app.py"]
