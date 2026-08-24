@@ -1,0 +1,3 @@
+# The env pod only orchestrates + calls the sandbox over HTTP (aiohttp comes
+# with nemo-gym[dev]); pytest etc. run in the sandbox image, not here.
+-e nemo-gym[dev] @ ../../
