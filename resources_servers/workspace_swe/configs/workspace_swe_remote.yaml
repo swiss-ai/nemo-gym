@@ -6,7 +6,7 @@ workspace_swe:
       url: https://gym-dev.swissai.svc.cscs.ch/workspace_swe
       host: gym-dev.swissai.svc.cscs.ch
       port: 443
-      domain: software_engineering
+      domain: coding
       verified: false
       description: Interactive SWE env — per-session workspace, shell + file edits, hidden-test reward.
 workspace_swe_gymnasium_agent:

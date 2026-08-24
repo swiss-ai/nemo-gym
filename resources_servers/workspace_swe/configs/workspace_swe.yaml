@@ -2,7 +2,7 @@ workspace_swe:
   resources_servers:
     workspace_swe:
       entrypoint: app.py
-      domain: software_engineering
+      domain: coding
       verified: false
       description: Interactive SWE env — per-session workspace, shell + file edits, hidden-test reward.
       value: Multi-turn agentic coding with a real workspace
