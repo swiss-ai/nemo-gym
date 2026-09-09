@@ -34,6 +34,7 @@ import ray
 import requests
 import uvicorn
 from aiohttp import (
+    ClientError,
     ClientOSError,
     ClientResponse,
     ClientResponseError,
@@ -524,7 +525,26 @@ class ServerClient(BaseModel):
         ):
             url_path = f"{rollout_path_prefix(rollout_id)}{url_path}"
 
-        return await request(method=method, url=f"{base_url}{url_path}", _internal=True, **kwargs)
+        # Remote servers (see `url` in _build_server_base_url) live behind
+        # ingresses whose pods can be OOM-killed, rescheduled, or scaled down
+        # mid-request. A single transient 5xx must not kill a whole training
+        # run, so retry idempotent gym calls with backoff. Transport-level
+        # drops (ServerDisconnectedError/ClientOSError) are already retried
+        # inside `request()` itself; this covers the case where the connection
+        # succeeded but the server answered with a 5xx.
+        last_exc: Optional[Exception] = None
+        for attempt in range(4):
+            if attempt:
+                await asyncio.sleep(min(2**attempt, 8))
+            try:
+                res = await request(method=method, url=f"{base_url}{url_path}", _internal=True, **kwargs)
+            except ClientError as e:
+                last_exc = e
+                continue
+            if res.status < 500 or attempt == 3:
+                return res
+            print(f"Got HTTP {res.status} from {server_name}{url_path} (attempt {attempt + 1}/4), retrying...")
+        raise last_exc  # only reachable when every attempt raised ClientError
 
     async def get(
         self,
@@ -595,6 +615,13 @@ class ServerClient(BaseModel):
         return base_url
 
     def _build_server_base_url(self, server_config_dict: OmegaConf) -> str:
+        # A server entry may declare an explicit `url` (e.g. an already-running
+        # remote server behind TLS/an ingress, which http://host:port can't
+        # express). Entries without an `entrypoint` are never spawned locally,
+        # so url + no entrypoint = "use this remote server as-is".
+        url = server_config_dict.get("url")
+        if url:
+            return str(url).rstrip("/")
         return f"http://{server_config_dict.host}:{server_config_dict.port}"
 
 

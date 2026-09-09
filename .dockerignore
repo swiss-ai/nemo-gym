@@ -18,3 +18,5 @@ coverage.xml
 .git
 **/*.nemo
 **/*.ckpt
+**/.venv
+fern
