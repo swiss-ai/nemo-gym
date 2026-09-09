@@ -1,0 +1,23 @@
+workspace_swe:
+  resources_servers:
+    workspace_swe:
+      entrypoint: app.py
+      domain: coding
+      verified: false
+      description: Interactive SWE env — per-session workspace, shell + file edits, hidden-test reward.
+      value: Multi-turn agentic coding with a real workspace
+workspace_swe_gymnasium_agent:
+  responses_api_agents:
+    gymnasium_agent:
+      entrypoint: app.py
+      resources_server:
+        type: resources_servers
+        name: workspace_swe
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      max_steps: 12
+      datasets:
+      - name: example
+        type: example
+        jsonl_fpath: resources_servers/workspace_swe/data/example.jsonl

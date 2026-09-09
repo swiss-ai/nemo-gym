@@ -1,0 +1,54 @@
+# Remote variant: use the math_with_judge verifier already running on
+# breithorn k8s (rob-poc GitOps) instead of spawning one per training job.
+#
+# `url` marks the server as remote: it stays in the config (entrypoint is
+# required for schema/ref validation) but the launcher skips spawning it and
+# ServerClient talks to the url directly (TLS ingress, source-whitelisted).
+# The agent still runs locally next to the policy model server.
+math_with_judge:
+  resources_servers:
+    math_with_judge:
+      entrypoint: app.py
+      # Gateway address (one host, path per env). The legacy per-env host
+      # https://nemo-gym-math-dev.swissai.svc.cscs.ch remains as an alias.
+      url: https://gym-dev.swissai.svc.cscs.ch/math_with_judge
+      host: nemo-gym-math-dev.swissai.svc.cscs.ch
+      port: 443
+      judge_model_server:
+        type: responses_api_models
+        name: policy_model
+      judge_responses_create_params: {
+        input: []
+      }
+      should_use_judge: false
+      domain: math
+      verified: false
+      description: OpenMathReasoning math verifier, remote on breithorn k8s
+math_with_judge_simple_agent:
+  responses_api_agents:
+    simple_agent:
+      entrypoint: app.py
+      resources_server:
+        type: resources_servers
+        name: math_with_judge
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      datasets:
+      - name: train
+        type: train
+        jsonl_fpath: resources_servers/math_with_judge/data/OpenMathReasoning_train.jsonl
+        huggingface_identifier:
+          repo_id: nvidia/Nemotron-RL-math-OpenMathReasoning
+          artifact_fpath: train.jsonl
+        license: Creative Commons Attribution 4.0 International
+      - name: validation
+        type: validation
+        jsonl_fpath: resources_servers/math_with_judge/data/OpenMathReasoning_aime24_validation.jsonl
+        huggingface_identifier:
+          repo_id: nvidia/Nemotron-RL-math-OpenMathReasoning
+          artifact_fpath: validation.jsonl
+        license: Apache 2.0
+      - name: example
+        type: example
+        jsonl_fpath: resources_servers/math_with_judge/data/example.jsonl

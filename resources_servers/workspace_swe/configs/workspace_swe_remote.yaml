@@ -1,0 +1,26 @@
+# Remote variant: env runs on breithorn k8s; agent drives it from Clariden.
+workspace_swe:
+  resources_servers:
+    workspace_swe:
+      entrypoint: app.py
+      url: https://gym-dev.swissai.svc.cscs.ch/workspace_swe
+      host: gym-dev.swissai.svc.cscs.ch
+      port: 443
+      domain: coding
+      verified: false
+      description: Interactive SWE env — per-session workspace, shell + file edits, hidden-test reward.
+workspace_swe_gymnasium_agent:
+  responses_api_agents:
+    gymnasium_agent:
+      entrypoint: app.py
+      resources_server:
+        type: resources_servers
+        name: workspace_swe
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      max_steps: 12
+      datasets:
+      - name: example
+        type: example
+        jsonl_fpath: resources_servers/workspace_swe/data/example.jsonl

@@ -1,0 +1,6 @@
+# Executes in-process in a per-session workspace, so the image needs a test
+# runner (git comes from the base image). Add per-task toolchains here as the
+# task pool grows (e.g. numpy, ruff).
+-e nemo-gym[dev] @ ../../
+pytest>=8
+pytest-timeout>=2.3
