@@ -59,6 +59,45 @@ from nemo_gym.environment.scaffold import ScaffoldError
 from nemo_gym.registry import EnvironmentCatalogEntry
 
 
+class TestRemoteServerLaunch:
+    @pytest.mark.parametrize("prefetch_only", [False, True])
+    def test_remote_entrypoint_does_not_create_venv_or_process(
+        self, monkeypatch: MonkeyPatch, prefetch_only: bool
+    ) -> None:
+        config = OmegaConf.create(
+            {
+                "dry_run": True,
+                "remote": {
+                    "resources_servers": {
+                        "math": {"entrypoint": "app.py", "domain": "math", "url": "https://gym.example/math"}
+                    }
+                },
+            }
+        )
+        monkeypatch.setattr(nemo_gym.cli.env, "get_global_config_dict", lambda **kwargs: config)
+        monkeypatch.setattr(nemo_gym.cli.env, "initialize_ray", MagicMock())
+        monkeypatch.setattr(
+            nemo_gym.cli.env.HeadServer, "run_webserver", MagicMock(return_value=(None, None, MagicMock()))
+        )
+        client = MagicMock()
+        client.return_value.poll_for_status.return_value = "success"
+        monkeypatch.setattr(nemo_gym.cli.env, "ServerClient", client)
+        setup = MagicMock()
+        launch = MagicMock()
+        monkeypatch.setattr(nemo_gym.cli.env, "setup_env_command", setup)
+        monkeypatch.setattr(nemo_gym.cli.env, "run_command", launch)
+
+        if prefetch_only:
+            nemo_gym.cli.env.prefetch(None)
+        else:
+            runner = RunHelper()
+            runner.start(None)
+            assert runner._processes == {}
+
+        setup.assert_not_called()
+        launch.assert_not_called()
+
+
 class TestSelectShard:
     def test_no_sharding_returns_all(self) -> None:
         paths = [Path(f"resources_servers/s{i}") for i in range(5)]

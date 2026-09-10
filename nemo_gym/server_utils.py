@@ -323,6 +323,9 @@ class ServerClient(BaseModel):
         return cls(head_server_config=head_server_config, global_config_dict=global_config_dict)
 
     def _build_server_base_url(self, server_config_dict: OmegaConf) -> str:
+        # Remote servers may include a gateway path prefix as well as a scheme and host.
+        if url := server_config_dict.get("url"):
+            return str(url).rstrip("/")
         return f"http://{server_config_dict.host}:{server_config_dict.port}"
 
     async def request(

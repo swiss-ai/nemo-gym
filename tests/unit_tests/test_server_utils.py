@@ -15,7 +15,7 @@
 import socket
 from unittest.mock import AsyncMock, MagicMock
 
-from pytest import MonkeyPatch, raises
+from pytest import MonkeyPatch, mark, raises
 
 import nemo_gym.global_config
 import nemo_gym.server_utils
@@ -49,6 +49,42 @@ _TEST_ADDR_INFO = (
 
 
 class TestServerUtils:
+    @mark.parametrize("base_url", ["https://gym.example/math", "https://gym.example/math/"])
+    async def test_remote_resource_request_preserves_path_cookies_and_response(
+        self, monkeypatch: MonkeyPatch, base_url: str
+    ) -> None:
+        client = ServerClient(
+            head_server_config=BaseServerConfig(host="localhost", port=8000),
+            global_config_dict=DictConfig(
+                {"math": {"resources_servers": {"math": {"url": base_url, "entrypoint": "app.py"}}}}
+            ),
+        )
+        # A failed stateful POST must not be replayed merely because a gateway returned 503.
+        response = MagicMock(status=503, cookies={"session": "updated-session"})
+        request = AsyncMock(return_value=response)
+        monkeypatch.setattr(nemo_gym.server_utils, "request", request)
+
+        result = await client.post("math", "/step", json={"action": "hit"}, cookies={"session": "rollout-session"})
+
+        assert result is response
+        assert result.cookies == {"session": "updated-session"}
+        request.assert_awaited_once_with(
+            method="POST",
+            url="https://gym.example/math/step",
+            _internal=True,
+            json={"action": "hit"},
+            cookies={"session": "rollout-session"},
+        )
+
+    def test_local_server_base_url(self) -> None:
+        client = ServerClient(
+            head_server_config=BaseServerConfig(host="localhost", port=8000),
+            global_config_dict=DictConfig({}),
+        )
+        assert client._build_server_base_url(DictConfig({"host": "localhost", "port": 9000})) == (
+            "http://localhost:9000"
+        )
+
     def test_global_aiohttp_client_request_debug_enabled(self, monkeypatch: MonkeyPatch) -> None:
         monkeypatch.setattr(nemo_gym.server_utils, "_GLOBAL_AIOHTTP_CLIENT_REQUEST_DEBUG", False)
         assert not nemo_gym.server_utils.is_global_aiohttp_client_request_debug_enabled()

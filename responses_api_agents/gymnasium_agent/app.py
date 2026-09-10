@@ -74,7 +74,7 @@ class GymnasiumAgent(SimpleResponsesAPIAgent):
         return result
 
     async def run(self, request: Request, body: GymnasiumAgentRunRequest) -> GymnasiumRunResponse:
-        env_cookies = request.cookies
+        env_cookies = dict(request.cookies)
         model_url_path = self.url_path_for_run("/v1/responses", body)
 
         reset_resp = await self.server_client.post(
@@ -85,7 +85,7 @@ class GymnasiumAgent(SimpleResponsesAPIAgent):
         )
         await raise_for_status(reset_resp)
         reset_data = EnvResetResponse.model_validate(await get_response_json(reset_resp))
-        env_cookies = reset_resp.cookies
+        env_cookies.update({name: cookie.value for name, cookie in reset_resp.cookies.items()})
 
         base_body = body.responses_create_params.model_copy(deep=True)
         if isinstance(base_body.input, str):
@@ -130,7 +130,8 @@ class GymnasiumAgent(SimpleResponsesAPIAgent):
             await raise_for_status(step_resp)
             step_data = EnvStepResponse.model_validate(await get_response_json(step_resp))
             total_reward += step_data.reward
-            env_cookies = step_resp.cookies
+            # Gateways may set affinity only on reset; retain it when a step updates the environment session.
+            env_cookies.update({name: cookie.value for name, cookie in step_resp.cookies.items()})
 
             if step_data.terminated or step_data.truncated:
                 finished = True

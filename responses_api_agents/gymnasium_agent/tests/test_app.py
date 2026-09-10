@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
+from http.cookies import SimpleCookie
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -129,6 +130,42 @@ class TestConfig:
 
 
 class TestRun:
+    @pytest.mark.asyncio
+    async def test_multi_step_retains_gateway_affinity_and_updates_session(self):
+        agent = _make_agent(max_steps=3)
+        seen_env_cookies = []
+
+        async def _post(server_name, url_path, json=None, cookies=None, **kw):
+            if url_path == "/v1/responses":
+                assert cookies is None or not cookies
+                return _FakeHttpResp(_model_response("hit"))
+
+            seen_env_cookies.append(dict(cookies))
+            if url_path == "/reset":
+                response = _FakeHttpResp({"observation": "play", "info": {}})
+                response.cookies = SimpleCookie({"gym-affinity": "pod-a", "session": "reset"})
+            else:
+                step = len(seen_env_cookies) - 1
+                response = _FakeHttpResp({"reward": 0.0, "terminated": step == 3, "truncated": False})
+                response.cookies = SimpleCookie({"session": f"step-{step}"})
+            return response
+
+        agent.server_client.post = AsyncMock(side_effect=_post)
+        req = MagicMock()
+        req.cookies = {"caller": "original"}
+        body = GymnasiumAgentRunRequest(responses_create_params={"input": "play"})
+
+        result = await agent.run(req, body)
+
+        assert result.terminated
+        assert seen_env_cookies == [
+            {"caller": "original"},
+            {"caller": "original", "gym-affinity": "pod-a", "session": "reset"},
+            {"caller": "original", "gym-affinity": "pod-a", "session": "step-1"},
+            {"caller": "original", "gym-affinity": "pod-a", "session": "step-2"},
+        ]
+        assert req.cookies == {"caller": "original"}
+
     @pytest.mark.asyncio
     async def test_terminates_on_first_step(self):
         agent = _make_agent()
