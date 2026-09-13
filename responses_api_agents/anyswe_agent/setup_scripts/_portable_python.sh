@@ -5,9 +5,28 @@ set -euo pipefail
 # Keep pip from satisfying deps from the host user site.
 export PYTHONNOUSERSITE=1
 
-PYTHON_VERSION="${PYTHON_VERSION:-3.12.8}"
-PBS_RELEASE="${PBS_RELEASE:-20241219}"
-ARCH="${ARCH:-x86_64-unknown-linux-gnu}"
+# nemo-gym's pyproject.toml requires >=3.13.14, so a 3.12 runtime cannot install
+# it: pip aborts with "Package 'nemo-gym' requires a different Python".
+PYTHON_VERSION="${PYTHON_VERSION:-3.13.15}"
+PBS_RELEASE="${PBS_RELEASE:-20260901}"
+
+# Detect the host architecture instead of assuming x86_64. The runtime is built
+# here but executed inside the task container, so a mismatch surfaces there as
+# "cannot execute binary file: Exec format error".
+detect_pbs_arch() {
+    local machine
+    machine="$(uname -m)"
+    case "$machine" in
+        x86_64 | amd64) echo "x86_64-unknown-linux-gnu" ;;
+        aarch64 | arm64) echo "aarch64-unknown-linux-gnu" ;;
+        *)
+            echo "Unsupported architecture for python-build-standalone: $machine" >&2
+            return 1
+            ;;
+    esac
+}
+
+ARCH="${ARCH:-$(detect_pbs_arch)}"
 
 install_portable_python() {
     if [ -x "$DEPS_DIR/bin/python3" ]; then
