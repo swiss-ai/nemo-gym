@@ -167,6 +167,7 @@ class HermesAgentConfig(BaseResponsesAPIAgentConfig):
     enabled_toolsets: Optional[list[str]] = None
     disabled_toolsets: Optional[list[str]] = None
     temperature: float | None = None
+    top_p: float | None = None
     terminal_backend: str = "local"
     terminal_timeout: int = 180
     system_prompt: Optional[str] = None
@@ -306,6 +307,11 @@ class HermesAgent(SimpleResponsesAPIAgent):
 
         def _patched_build_api_kwargs(api_messages):
             kw = _original_build_api_kwargs(api_messages)
+            # hermes-agent has no top_p knob, but NeMo-RL's vLLM server rejects any
+            # request with an unset top_p: vLLM would otherwise resolve it from the
+            # model's generation_config.json and silently sample off-policy.
+            if self.config.top_p is not None:
+                kw["top_p"] = self.config.top_p
             ctk = kw.setdefault("extra_body", {}).setdefault("chat_template_kwargs", {})
             ctk.setdefault("enable_thinking", True)
             ctk["truncate_history_thinking"] = False
