@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import json
 from collections.abc import Mapping
 from time import perf_counter, time
@@ -60,6 +61,7 @@ class SimpleAgentConfig(BaseResponsesAPIAgentConfig):
     resources_server: ResourcesServerRef
     model_server: ModelServerRef
     max_steps: int = None
+    retry_verify_on_502: bool = False
 
 
 class SimpleAgentRunRequest(BaseRunRequest):
@@ -326,12 +328,18 @@ class SimpleAgent(SimpleResponsesAPIAgent):
 
         verify_request = SimpleAgentVerifyRequest.model_validate(body.model_dump() | {"response": model_response_json})
 
-        verify_response = await self.server_client.post(
-            server_name=self.config.resources_server.name,
-            url_path="/verify",
-            json=verify_request.model_dump(),
-            cookies=cookies,
-        )
+        attempts = 3 if self.config.retry_verify_on_502 else 1
+        for attempt in range(attempts):
+            verify_response = await self.server_client.post(
+                server_name=self.config.resources_server.name,
+                url_path="/verify",
+                json=verify_request.model_dump(),
+                cookies=cookies,
+            )
+            if verify_response.status != 502 or attempt == attempts - 1:
+                break
+            verify_response.release()
+            await asyncio.sleep(0.5 * (attempt + 1))
         await raise_for_status(verify_response)
         result = await get_response_json(verify_response)
         if trajectory is not None:

@@ -4565,6 +4565,7 @@ def _make_top_logprobs_model(
     *,
     extra_body: dict[str, Any] | None = None,
     request_prompt_and_generation_token_ids: bool = False,
+    propagate_required_prefix_token_ids: bool = False,
 ) -> VLLMModel:
     """A VLLMModel with the minimum config needed to exercise top_logprobs handling."""
     config = VLLMModelConfig(
@@ -4577,6 +4578,7 @@ def _make_top_logprobs_model(
         model="dummy_model",
         return_token_id_information=return_token_id_information,
         request_prompt_and_generation_token_ids=request_prompt_and_generation_token_ids,
+        propagate_required_prefix_token_ids=propagate_required_prefix_token_ids,
         uses_reasoning_parser=False,
         uses_interleaved_reasoning=False,
         extra_body=extra_body,
@@ -4625,6 +4627,106 @@ class TestTopLogprobsHandling:
         )
 
         assert result["return_token_ids"] is True
+
+    def test_capture_path_propagates_latest_assistant_token_prefix(self) -> None:
+        model = _make_top_logprobs_model(
+            return_token_id_information=True,
+            propagate_required_prefix_token_ids=True,
+        )
+        old_prefix = {
+            "role": "assistant",
+            "content": "old",
+            "prompt_token_ids": [1, 2],
+            "generation_token_ids": [3],
+            "generation_log_probs": [-0.1],
+        }
+        latest_prefix = {
+            "role": "assistant",
+            "content": "latest",
+            "prompt_token_ids": [4, 5],
+            "generation_token_ids": [6, 7],
+            "generation_log_probs": [-0.2, -0.3],
+        }
+
+        result = model._preprocess_chat_completion_create_params(
+            MagicMock(),
+            {
+                "model": "dummy_model",
+                "messages": [
+                    old_prefix,
+                    {"role": "user", "content": "observation"},
+                    latest_prefix,
+                    {"role": "user", "content": "next observation"},
+                ],
+            },
+        )
+
+        assert result["required_prefix_token_ids"] == [4, 5, 6, 7]
+
+        disabled_model = _make_top_logprobs_model(return_token_id_information=True)
+        disabled_result = disabled_model._preprocess_chat_completion_create_params(
+            MagicMock(),
+            {"model": "dummy_model", "messages": [latest_prefix, {"role": "user", "content": "next"}]},
+        )
+        assert "required_prefix_token_ids" not in disabled_result
+
+        result = model._preprocess_chat_completion_create_params(
+            MagicMock(),
+            {
+                "model": "dummy_model",
+                "required_prefix_token_ids": [99],
+                "messages": [latest_prefix, {"role": "user", "content": "observation"}],
+            },
+        )
+
+        assert result["required_prefix_token_ids"] == [99]
+
+        result = model._preprocess_chat_completion_create_params(
+            MagicMock(),
+            {
+                "model": "dummy_model",
+                "messages": [
+                    latest_prefix,
+                    {"role": "assistant", "content": "untracked"},
+                    {"role": "user", "content": "observation"},
+                ],
+            },
+        )
+        assert "required_prefix_token_ids" not in result
+
+        with raises(RuntimeError, match="partial token metadata"):
+            model._preprocess_chat_completion_create_params(
+                MagicMock(),
+                {
+                    "model": "dummy_model",
+                    "messages": [
+                        {"role": "assistant", "content": "partial", "prompt_token_ids": [1]},
+                        {"role": "user", "content": "observation"},
+                    ],
+                },
+            )
+
+    def test_prefix_propagation_requires_token_capture_and_chat_completions(self) -> None:
+        with raises(ValueError, match="requires return_token_id_information"):
+            _make_top_logprobs_model(
+                return_token_id_information=False,
+                propagate_required_prefix_token_ids=True,
+            )
+
+        with raises(ValueError, match="only supported with the chat completions API"):
+            VLLMModelConfig(
+                host="0.0.0.0",
+                port=8080,
+                entrypoint="",
+                name="vllm_model",
+                base_url="http://localhost:9999/v1",
+                api_key="dummy_key",  # pragma: allowlist secret
+                model="dummy_model",
+                return_token_id_information=True,
+                propagate_required_prefix_token_ids=True,
+                uses_reasoning_parser=False,
+                use_completions_api=True,
+            )
 
     def test_capture_path_rejects_multiple_choices(self) -> None:
         model = _make_top_logprobs_model(return_token_id_information=True)
@@ -4884,6 +4986,43 @@ class TestTopLogprobsHandling:
             mm_processor_kwargs={"fps": 2},
             required_prefix_token_ids=[1, 2, 3],
         )
+
+    def test_capture_path_forwards_dynamic_prefix_to_chat_and_tokenize(self) -> None:
+        model = _make_top_logprobs_model(
+            return_token_id_information=True,
+            propagate_required_prefix_token_ids=True,
+        )
+        app = model.setup_webserver()
+        assistant = {
+            "role": "assistant",
+            "content": "previous response",
+            "prompt_token_ids": [10, 20],
+            "generation_token_ids": [30, 40],
+            "generation_log_probs": [-0.1, -0.2],
+        }
+
+        async def mock_create_chat_completion(**kwargs):
+            return self._capture_chat_completion_dict(
+                logprobs={
+                    "content": [
+                        {"token": "token_id:123", "logprob": -0.1, "bytes": None, "top_logprobs": []},
+                    ]
+                }
+            )
+
+        mock_client = MagicMock(spec=NeMoGymAsyncOpenAI)
+        mock_client.create_chat_completion = AsyncMock(side_effect=mock_create_chat_completion)
+        mock_client.create_tokenize = AsyncMock(return_value={"tokens": [10, 20, 30, 40, 50]})
+        model._clients = [mock_client]
+
+        response = TestClient(app).post(
+            "/v1/chat/completions",
+            json={"messages": [assistant, {"role": "user", "content": "observation"}]},
+        )
+
+        assert response.status_code == 200
+        assert mock_client.create_chat_completion.await_args.kwargs["required_prefix_token_ids"] == [10, 20, 30, 40]
+        assert mock_client.create_tokenize.await_args.kwargs["required_prefix_token_ids"] == [10, 20, 30, 40]
 
     def test_capture_path_rejects_partial_message_bundle(self) -> None:
         model = _make_top_logprobs_model(return_token_id_information=True)

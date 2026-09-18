@@ -33,6 +33,7 @@ from nemo_gym.openai_utils import (
 from nemo_gym.rollout_collection import _attach_trajectory_record
 from nemo_gym.rollout_observability import TrajectoryRecord
 from nemo_gym.server_utils import ServerClient
+from responses_api_agents.simple_agent import app as simple_agent_app
 from responses_api_agents.simple_agent.app import (
     ModelServerRef,
     ResourcesServerRef,
@@ -387,6 +388,51 @@ class TestApp:
             "/verify",
         ]
         assert "ng_trajectory" not in result.model_dump(mode="json")
+
+    @pytest.mark.parametrize(("retry_enabled", "expected_verify_calls"), ((False, 1), (True, 2)))
+    async def test_verify_502_retry_requires_explicit_opt_in(
+        self, monkeypatch: MonkeyPatch, retry_enabled: bool, expected_verify_calls: int
+    ) -> None:
+        server, server_client = _make_agent(False)
+        server.config.retry_verify_on_502 = retry_enabled
+        monkeypatch.setattr(simple_agent_app.asyncio, "sleep", AsyncMock())
+
+        model_response = {
+            "id": "response-1",
+            "created_at": 1.0,
+            "model": "model",
+            "object": "response",
+            "output": [],
+            "parallel_tool_calls": True,
+            "tool_choice": "auto",
+            "tools": [],
+        }
+        verify_responses = [_mock_response(status=502), _mock_response(status=200)]
+
+        async def post(*, url_path, **kwargs):
+            if url_path == "/seed_session":
+                return _mock_response()
+            if url_path.endswith("/v1/responses"):
+                return _mock_response(model_response)
+            assert url_path == "/verify"
+            response = verify_responses.pop(0)
+            if response.status == 200:
+                response.read = AsyncMock(return_value=json.dumps(kwargs["json"] | {"reward": 1.0}))
+            return response
+
+        server_client.post = AsyncMock(side_effect=post)
+        body = SimpleAgentRunRequest.model_validate({"responses_create_params": {"input": "question"}})
+        request = MagicMock(cookies={})
+
+        if retry_enabled:
+            result = await server.run(request, body)
+            assert result.reward == 1.0
+        else:
+            with pytest.raises(Exception):
+                await server.run(request, body)
+
+        verify_calls = [call for call in server_client.post.await_args_list if call.kwargs["url_path"] == "/verify"]
+        assert len(verify_calls) == expected_verify_calls
 
     async def test_responses_continues_on_malformed_tool_call_arguments(self, monkeypatch: MonkeyPatch) -> None:
         """Malformed JSON in a tool-call's arguments must not crash the rollout.

@@ -3,6 +3,8 @@ blackjack:
     blackjack:
       entrypoint: app.py
       url: https://gym-dev.swissai.svc.cscs.ch/blackjack
+      # Temporary wire compatibility for the deployed pre-b1e0 Gym service. Remove after it accepts null usage details.
+      legacy_response_usage_details_as_zero: true
       domain: games
       verified: false
       description: Blackjack. Model hits or stands. Reward +1 win, 0 draw, -1 loss/bust.

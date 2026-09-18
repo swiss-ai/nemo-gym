@@ -154,6 +154,10 @@ class VLLMModelConfig(BaseResponsesAPIModelConfig):
     return_token_id_information: bool
     # Request inline prompt and generation token IDs from compatible vLLM endpoints.
     request_prompt_and_generation_token_ids: bool = False
+    # NeMo-RL's vLLM server can preserve generated token IDs across agent turns
+    # when it receives the previous assistant turn as an explicit prefix.
+    # Keep this opt-in because it is a NeMo-RL extension to the OpenAI schema.
+    propagate_required_prefix_token_ids: bool = False
 
     uses_reasoning_parser: bool
     uses_interleaved_reasoning: bool = True
@@ -225,6 +229,14 @@ class VLLMModelConfig(BaseResponsesAPIModelConfig):
     tokenizer: Optional[str] = None
 
     def model_post_init(self, context):
+        if self.propagate_required_prefix_token_ids and not self.return_token_id_information:
+            raise ValueError(
+                "propagate_required_prefix_token_ids requires return_token_id_information=true."
+            )
+        if self.propagate_required_prefix_token_ids and self.use_completions_api:
+            raise ValueError(
+                "propagate_required_prefix_token_ids is only supported with the chat completions API."
+            )
         if isinstance(self.base_url, str):
             self.base_url = [self.base_url]
         return super().model_post_init(context)
@@ -600,6 +612,20 @@ class VLLMModel(SimpleResponsesAPIModel):
             else:
                 # No user message found — create one with just the audio blocks.
                 body_dict.setdefault("messages", []).append({"role": "user", "content": list(audio_blocks)})
+
+        if (
+            self.config.propagate_required_prefix_token_ids
+            and body_dict.get("required_prefix_token_ids") is None
+        ):
+            for message_dict in reversed(body_dict.get("messages", [])):
+                if message_dict.get("role") != "assistant":
+                    continue
+                token_bundle = self._extract_message_token_bundle(message_dict)
+                if token_bundle is not None:
+                    body_dict["required_prefix_token_ids"] = (
+                        token_bundle["prompt_token_ids"] + token_bundle["generation_token_ids"]
+                    )
+                break
 
         self._apply_sampling_overrides(body_dict)
         self._validate_single_choice_token_request(body_dict)

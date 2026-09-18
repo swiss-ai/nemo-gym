@@ -3,6 +3,8 @@ math_with_judge:
     math_with_judge:
       entrypoint: app.py
       url: https://gym-dev.swissai.svc.cscs.ch/math_with_judge
+      # Temporary wire compatibility for the deployed pre-b1e0 Gym service. Remove after it accepts null usage details.
+      legacy_response_usage_details_as_zero: true
       judge_model_server:
         type: responses_api_models
         name: policy_model
@@ -24,6 +26,9 @@ math_with_judge_simple_agent:
       model_server:
         type: responses_api_models
         name: policy_model
+      # The hosted Math verifier can transiently return 502 during a deployment.
+      # This opt-in retries only its idempotent /verify request.
+      retry_verify_on_502: true
       datasets:
       - name: train
         type: train

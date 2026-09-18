@@ -76,6 +76,67 @@ class TestServerUtils:
             cookies={"session": "rollout-session"},
         )
 
+    @mark.parametrize("url_path", ["/verify", "/ng-rollout/rollout-1/step"])
+    async def test_remote_resource_legacy_usage_compatibility_is_scoped_to_response_requests(
+        self, monkeypatch: MonkeyPatch, url_path: str
+    ) -> None:
+        payload = {
+            "response": {
+                "usage": {
+                    "input_tokens_details": {"cached_tokens": None, "other": 7},
+                    "output_tokens_details": {"reasoning_tokens": None, "other": 11},
+                }
+            }
+        }
+        client = ServerClient(
+            head_server_config=BaseServerConfig(host="localhost", port=8000),
+            global_config_dict=DictConfig(
+                {
+                    "math": {
+                        "resources_servers": {
+                            "math": {
+                                "url": "https://gym.example/math",
+                                "entrypoint": "app.py",
+                                "legacy_response_usage_details_as_zero": True,
+                            }
+                        }
+                    }
+                }
+            ),
+        )
+        request = AsyncMock(return_value=MagicMock())
+        monkeypatch.setattr(nemo_gym.server_utils, "request", request)
+
+        await client.post("math", url_path, json=payload)
+
+        assert payload["response"]["usage"]["input_tokens_details"]["cached_tokens"] is None
+        assert payload["response"]["usage"]["output_tokens_details"]["reasoning_tokens"] is None
+        request_payload = request.await_args.kwargs["json"]
+        assert request_payload["response"]["usage"]["input_tokens_details"] == {"cached_tokens": 0, "other": 7}
+        assert request_payload["response"]["usage"]["output_tokens_details"] == {"reasoning_tokens": 0, "other": 11}
+
+    async def test_remote_resource_usage_compatibility_is_opt_in(self, monkeypatch: MonkeyPatch) -> None:
+        payload = {
+            "response": {
+                "usage": {
+                    "input_tokens_details": {"cached_tokens": None},
+                    "output_tokens_details": {"reasoning_tokens": None},
+                }
+            }
+        }
+        client = ServerClient(
+            head_server_config=BaseServerConfig(host="localhost", port=8000),
+            global_config_dict=DictConfig(
+                {"math": {"resources_servers": {"math": {"url": "https://gym.example/math", "entrypoint": "app.py"}}}}
+            ),
+        )
+        request = AsyncMock(return_value=MagicMock())
+        monkeypatch.setattr(nemo_gym.server_utils, "request", request)
+
+        await client.post("math", "/verify", json=payload)
+
+        assert request.await_args.kwargs["json"] is payload
+
     def test_local_server_base_url(self) -> None:
         client = ServerClient(
             head_server_config=BaseServerConfig(host="localhost", port=8000),
