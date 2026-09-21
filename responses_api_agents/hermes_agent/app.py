@@ -14,6 +14,7 @@
 # limitations under the License.
 import asyncio
 import atexit
+import functools
 import logging
 import os
 import shutil
@@ -268,6 +269,55 @@ class HermesAgent(SimpleResponsesAPIAgent):
     def _model_name(self) -> str:
         return self.config.model or str(self.config.model_server.name)
 
+    def _enforce_sampling_params(self, agent) -> None:
+        """Stamp the configured sampling params onto every request the agent issues.
+
+        hermes-agent builds request kwargs in more than one place. The turn loop
+        goes through ``_build_api_kwargs``, but the max-iteration summary and its
+        retry hand-roll a dict carrying neither ``temperature`` nor ``top_p``.
+        NeMo-RL's vLLM server rejects any request whose sampling params are unset
+        or differ from the training profile, so patching the turn loop alone still
+        loses the summary on every rollout that exhausts ``max_turns``. Every
+        client is built by ``_create_openai_client`` -- per-request ones and those
+        rebuilt after a close included -- so wrapping that factory, plus the client
+        already built during agent init, covers all call sites.
+        """
+        sampling = {
+            key: value
+            for key, value in (
+                ("temperature", self.config.temperature),
+                ("top_p", self.config.top_p),
+            )
+            if value is not None
+        }
+        if not sampling:
+            return
+
+        def _wrap(client):
+            completions = getattr(getattr(client, "chat", None), "completions", None)
+            if completions is None or getattr(completions, "_nemo_rl_sampling_wrapped", False):
+                return client
+            original_create = completions.create
+
+            @functools.wraps(original_create)
+            def _create(*args, **kwargs):
+                kwargs.update(sampling)
+                return original_create(*args, **kwargs)
+
+            completions.create = _create
+            completions._nemo_rl_sampling_wrapped = True
+            return client
+
+        original_create_client = agent._create_openai_client
+
+        @functools.wraps(original_create_client)
+        def _patched_create_openai_client(*args, **kwargs):
+            return _wrap(original_create_client(*args, **kwargs))
+
+        agent._create_openai_client = _patched_create_openai_client
+        if getattr(agent, "client", None) is not None:
+            _wrap(agent.client)
+
     async def _create_response(
         self,
         body: NeMoGymResponseCreateParamsNonStreaming,
@@ -307,17 +357,13 @@ class HermesAgent(SimpleResponsesAPIAgent):
 
         def _patched_build_api_kwargs(api_messages):
             kw = _original_build_api_kwargs(api_messages)
-            # hermes-agent has no top_p knob, but NeMo-RL's vLLM server rejects any
-            # request with an unset top_p: vLLM would otherwise resolve it from the
-            # model's generation_config.json and silently sample off-policy.
-            if self.config.top_p is not None:
-                kw["top_p"] = self.config.top_p
             ctk = kw.setdefault("extra_body", {}).setdefault("chat_template_kwargs", {})
             ctk.setdefault("enable_thinking", True)
             ctk["truncate_history_thinking"] = False
             return kw
 
         agent._build_api_kwargs = _patched_build_api_kwargs
+        self._enforce_sampling_params(agent)
         observer = None
         if observation_collector is not None:
             try:
