@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
+from http.cookies import SimpleCookie
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -140,6 +141,46 @@ class TestConfig:
 
 
 class TestRun:
+    @pytest.mark.asyncio
+    async def test_remote_affinity_survives_session_rotation_and_cleanup(self):
+        agent = _make_agent(max_steps=3, observability=False)
+        seen = []
+        steps = 0
+
+        async def post(server_name, url_path, json=None, cookies=None, **kwargs):
+            nonlocal steps
+            if server_name == "policy_model":
+                assert not cookies
+                return _FakeHttpResp(_model_response("hit"))
+            # aiohttp accepts cookie Morsels as well as strings. Check their wire values.
+            wire_cookies = SimpleCookie(cookies)
+            seen.append((url_path, {name: value.value for name, value in wire_cookies.items()}))
+            if url_path == "/reset":
+                response = _FakeHttpResp({"observation": "play", "info": {"supports_explicit_close": True}})
+                response.cookies = SimpleCookie({"affinity": "pod-a", "session": "reset"})
+            elif url_path == "/step":
+                steps += 1
+                response = _FakeHttpResp({"reward": 0.0, "terminated": steps == 3})
+                response.cookies = SimpleCookie({"session": f"step-{steps}"})
+            else:
+                assert url_path == "/close"
+                response = _FakeHttpResp({})
+            return response
+
+        agent.server_client.post = AsyncMock(side_effect=post)
+        request = MagicMock(cookies={"caller": "original"})
+        result = await agent.run(request, GymnasiumAgentRunRequest(responses_create_params={"input": "play"}))
+
+        assert result.terminated
+        assert seen == [
+            ("/reset", {"caller": "original"}),
+            ("/step", {"caller": "original", "affinity": "pod-a", "session": "reset"}),
+            ("/step", {"caller": "original", "affinity": "pod-a", "session": "step-1"}),
+            ("/step", {"caller": "original", "affinity": "pod-a", "session": "step-2"}),
+            ("/close", {"caller": "original", "affinity": "pod-a", "session": "step-3"}),
+        ]
+        assert request.cookies == {"caller": "original"}
+
     @pytest.mark.asyncio
     async def test_terminates_on_first_step(self):
         agent = _make_agent()

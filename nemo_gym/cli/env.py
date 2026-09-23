@@ -422,6 +422,10 @@ class RunHelper:  # pragma: no cover
             if "entrypoint" not in server_config_dict:
                 continue
 
+            # Retain entrypoint metadata for validation without launching remote services.
+            if server_config_dict.get("url"):
+                continue
+
             # TODO: This currently only handles relative entrypoints. Later on we can resolve the absolute path.
             entrypoint_fpath = Path(server_config_dict.entrypoint)
             assert not entrypoint_fpath.is_absolute()
@@ -769,6 +773,9 @@ def prefetch(
             continue
 
         if "entrypoint" not in server_config_dict:
+            continue
+
+        if server_config_dict.get("url"):
             continue
 
         dir_path = _resolve_server_dir(Path(first_key, second_key))

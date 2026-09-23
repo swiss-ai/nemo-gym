@@ -438,6 +438,55 @@ DEFAULT_HEAD_SERVER_PORT = 11000
 ServerStatus = Union[Literal["success"], Literal["connection_error"], Literal["timeout"], Literal["unknown_error"]]
 
 
+_LEGACY_RESPONSE_USAGE_DETAILS_AS_ZERO = "legacy_response_usage_details_as_zero"
+
+
+def _coerce_legacy_remote_response_usage_details(
+    json_obj: Any,
+    *,
+    server_entry: Any,
+    server_config_dict: DictConfig,
+    method: str,
+    url_path: str,
+) -> Any:
+    """Copy unknown usage counts to zero only at an opted-in legacy resource boundary.
+
+    Older remote verifiers require integer cache and reasoning counts, although
+    grading does not consume them. Keep unknown counts in the original response.
+    """
+    if not server_config_dict.get(_LEGACY_RESPONSE_USAGE_DETAILS_AS_ZERO, False):
+        return json_obj
+
+    if server_entry is None or "resources_servers" not in server_entry or not server_config_dict.get("url"):
+        raise ValueError(
+            f"{_LEGACY_RESPONSE_USAGE_DETAILS_AS_ZERO} requires a remote resources_servers configuration."
+        )
+
+    endpoint = url_path.split("?", 1)[0].rsplit("/", 1)[-1]
+    if method != "POST" or endpoint not in {"verify", "step"} or not isinstance(json_obj, dict):
+        return json_obj
+    response = json_obj.get("response")
+    if not isinstance(response, dict):
+        return json_obj
+    usage = response.get("usage")
+    if not isinstance(usage, dict):
+        return json_obj
+
+    normalized_json = json_obj.copy()
+    normalized_response = response.copy()
+    normalized_usage = usage.copy()
+    normalized_response["usage"] = normalized_usage
+    normalized_json["response"] = normalized_response
+    for details_name, detail_name in (
+        ("input_tokens_details", "cached_tokens"),
+        ("output_tokens_details", "reasoning_tokens"),
+    ):
+        details = usage.get(details_name)
+        if isinstance(details, dict) and detail_name in details and details[detail_name] is None:
+            normalized_usage[details_name] = details | {detail_name: 0}
+    return normalized_json
+
+
 class ServerClient(BaseModel):
     head_server_config: BaseServerConfig
 
@@ -500,14 +549,26 @@ class ServerClient(BaseModel):
         else:
             base_url = self._resolve_base_url(server_name)
 
+        server_entry = self.global_config_dict.get(server_name)
         json_obj = kwargs.get("json")
         if "json" in kwargs:
             if isinstance(json_obj, BaseModel):
                 json_obj = json_obj.model_dump(exclude_unset=True)
-                kwargs["json"] = json_obj
+            server_config_dict = (
+                get_first_server_config_dict(self.global_config_dict, server_name)
+                if server_entry is not None
+                else DictConfig({})
+            )
+            json_obj = _coerce_legacy_remote_response_usage_details(
+                json_obj,
+                server_entry=server_entry,
+                server_config_dict=server_config_dict,
+                method=method,
+                url_path=url_path,
+            )
+            kwargs["json"] = json_obj
 
         observability_enabled = self.global_config_dict.get(OBSERVABILITY_ENABLED_KEY_NAME, False)
-        server_entry = self.global_config_dict.get(server_name)
         rollout_id = current_rollout_id()
         if observability_enabled and server_entry is not None and "resources_servers" in server_entry:
             if url_path == "/verify":
@@ -596,6 +657,9 @@ class ServerClient(BaseModel):
         return base_url
 
     def _build_server_base_url(self, server_config_dict: OmegaConf) -> str:
+        # Preserve gateway path prefixes; callers append the endpoint path.
+        if url := server_config_dict.get("url"):
+            return str(url).rstrip("/")
         return f"http://{server_config_dict.host}:{server_config_dict.port}"
 
 

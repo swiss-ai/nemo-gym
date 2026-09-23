@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import json
 from collections.abc import Mapping
 from time import perf_counter, time
@@ -33,6 +34,7 @@ from nemo_gym.base_responses_api_agent import (
     SimpleResponsesAPIAgent,
 )
 from nemo_gym.config_types import ModelServerRef, ResourcesServerRef
+from nemo_gym.global_config import get_first_server_config_dict
 from nemo_gym.openai_utils import (
     NeMoGymEasyInputMessage,
     NeMoGymFunctionCallOutput,
@@ -60,6 +62,8 @@ class SimpleAgentConfig(BaseResponsesAPIAgentConfig):
     resources_server: ResourcesServerRef
     model_server: ModelServerRef
     max_steps: int = None
+    # Opt in only for idempotent verifiers behind a gateway that can return 502.
+    retry_verify_on_502: bool = False
 
 
 class SimpleAgentRunRequest(BaseRunRequest):
@@ -334,14 +338,27 @@ class SimpleAgent(SimpleResponsesAPIAgent):
             verify_request = SimpleAgentVerifyRequest.model_validate(
                 body.model_dump() | {"response": model_response_json}
             )
-            verify_response = await self.server_client.post(
-                server_name=self.config.resources_server.name,
-                url_path="/verify",
-                json=verify_request.model_dump(),
-                cookies=cookies,
-            )
+            attempts = 3 if self.config.retry_verify_on_502 else 1
+            for attempt in range(attempts):
+                verify_response = await self.server_client.post(
+                    server_name=self.config.resources_server.name,
+                    url_path="/verify",
+                    json=verify_request.model_dump(),
+                    cookies=cookies,
+                )
+                if verify_response.status != 502 or attempt == attempts - 1:
+                    break
+                verify_response.release()
+                await asyncio.sleep(0.5 * (attempt + 1))
             await raise_for_status(verify_response)
             result = await get_response_json(verify_response)
+            resource_name = self.config.resources_server.name
+            if resource_name in self.server_client.global_config_dict:
+                resource_config = get_first_server_config_dict(self.server_client.global_config_dict, resource_name)
+                if resource_config.get("legacy_response_usage_details_as_zero", False):
+                    # Legacy verifiers echo the wire-only zero counts. Retain the
+                    # model's authoritative usage when returning to the trainer.
+                    result["response"]["usage"] = model_response_json.get("usage")
         if trajectory is not None:
             resolved = result.get("resolved")
             if isinstance(resolved, bool) and trajectory.turns:

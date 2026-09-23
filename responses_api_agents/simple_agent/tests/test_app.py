@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock, call
 
@@ -19,6 +20,7 @@ import orjson
 import pytest
 from fastapi import Response
 from fastapi.testclient import TestClient
+from omegaconf import OmegaConf
 from pytest import MonkeyPatch
 
 from nemo_gym.global_config import ROLLOUT_INDEX_KEY_NAME, TASK_INDEX_KEY_NAME
@@ -32,7 +34,7 @@ from nemo_gym.openai_utils import (
 )
 from nemo_gym.rollout_collection import _attach_trajectory_record
 from nemo_gym.rollout_observability import TrajectoryRecord
-from nemo_gym.server_utils import ServerClient
+from nemo_gym.server_utils import BaseServerConfig, ServerClient
 from responses_api_agents.simple_agent.app import (
     ModelServerRef,
     ResourcesServerRef,
@@ -80,6 +82,119 @@ def _mock_response(payload=None, *, status=200, content="") -> MagicMock:
 
 
 class TestApp:
+    @pytest.mark.parametrize("legacy", [False, True])
+    async def test_echoing_verifier_preserves_original_model_usage(self, monkeypatch, legacy):
+        server, _ = _make_agent(False)
+        server.server_client = ServerClient(
+            head_server_config=BaseServerConfig(host="localhost", port=8000),
+            global_config_dict=OmegaConf.create(
+                {
+                    "resources": {
+                        "resources_servers": {
+                            "math": {
+                                "url": "https://legacy.example/math",
+                                "entrypoint": "app.py",
+                                "legacy_response_usage_details_as_zero": legacy,
+                            }
+                        }
+                    },
+                    "simple": {"responses_api_agents": {"simple_agent": {"host": "localhost", "port": 9000}}},
+                }
+            ),
+        )
+        model_response = {
+            "id": "response-1",
+            "created_at": 1.0,
+            "model": "model",
+            "object": "response",
+            "output": [],
+            "parallel_tool_calls": True,
+            "tool_choice": "auto",
+            "tools": [],
+            "usage": {
+                "input_tokens": 1,
+                "input_tokens_details": {"cached_tokens": None},
+                "output_tokens": 3,
+                "output_tokens_details": {"reasoning_tokens": None},
+                "total_tokens": 4,
+            },
+        }
+
+        async def transport(*, method, url, json=None, **kwargs):
+            if url.endswith("/seed_session"):
+                return _mock_response()
+            if url.endswith("/v1/responses"):
+                return _mock_response(model_response)
+            assert url == "https://legacy.example/math/verify"
+            expected = 0 if legacy else None
+            assert json["response"]["usage"]["input_tokens_details"]["cached_tokens"] == expected
+            assert json["response"]["usage"]["output_tokens_details"]["reasoning_tokens"] == expected
+            return _mock_response(json | {"reward": 1.0, "verifier_note": "preserved"})
+
+        monkeypatch.setattr("nemo_gym.server_utils.request", transport)
+        result = await server.run(
+            MagicMock(cookies={}), SimpleAgentRunRequest(responses_create_params={"input": "question"})
+        )
+
+        assert result.response.usage.input_tokens_details.cached_tokens is None
+        assert result.response.usage.output_tokens_details.reasoning_tokens is None
+        assert result.response.usage.total_tokens == 4
+        assert result.reward == 1.0
+        assert result.model_extra["verifier_note"] == "preserved"
+
+    @pytest.mark.parametrize(
+        "enabled,statuses,expected_calls,success",
+        [
+            (False, [502], 1, False),
+            (True, [502, 200], 2, True),
+            (True, [502, 502, 502], 3, False),
+            (True, [503], 1, False),
+        ],
+    )
+    async def test_verify_retry_is_opt_in_bounded_and_only_for_502(
+        self, monkeypatch, enabled, statuses, expected_calls, success
+    ):
+        server, client = _make_agent(False)
+        server.config.retry_verify_on_502 = enabled
+        monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+        model_response = {
+            "id": "response-1",
+            "created_at": 1.0,
+            "model": "model",
+            "object": "response",
+            "output": [],
+            "parallel_tool_calls": True,
+            "tool_choice": "auto",
+            "tools": [],
+        }
+        responses = []
+
+        async def post(*, url_path, **kwargs):
+            if url_path == "/seed_session":
+                return _mock_response()
+            if url_path.endswith("/v1/responses"):
+                return _mock_response(model_response)
+            assert url_path == "/verify"
+            status = statuses[len(responses)]
+            response = _mock_response(kwargs["json"] | {"reward": 1.0}, status=status)
+            if status != 200:
+                response.raise_for_status.side_effect = RuntimeError(f"HTTP {status}")
+            responses.append(response)
+            return response
+
+        client.post = AsyncMock(side_effect=post)
+        body = SimpleAgentRunRequest(responses_create_params={"input": "question"})
+        if success:
+            result = await server.run(MagicMock(cookies={}), body)
+            assert result.reward == 1.0
+        else:
+            with pytest.raises(RuntimeError, match="HTTP"):
+                await server.run(MagicMock(cookies={}), body)
+        assert len(responses) == expected_calls
+        for response in responses[:-1]:
+            response.release.assert_called_once()
+        responses[-1].release.assert_not_called()
+
     def test_sanity(self) -> None:
         config = SimpleAgentConfig(
             host="0.0.0.0",

@@ -15,6 +15,7 @@
 import asyncio
 import json
 import logging
+import os
 from typing import Any, Union
 from unittest.mock import AsyncMock, MagicMock
 
@@ -5186,6 +5187,14 @@ class TestSamplingOverrides:
 
 
 class TestEndpointFile:
+    @staticmethod
+    def _publish(path, content: str) -> None:
+        # Immediate rewrites can share one mtime on cluster filesystems.
+        # These tests exercise cache invalidation, so publication must advance it.
+        stamp = path.stat().st_mtime + 1 if path.exists() else 1
+        path.write_text(content)
+        os.utime(path, (stamp, stamp))
+
     def _make_server(self, tmp_path, **overrides) -> VLLMModel:
         params = dict(
             host="0.0.0.0",
@@ -5203,7 +5212,7 @@ class TestEndpointFile:
         return VLLMModel(config=VLLMModelConfig(**params), server_client=MagicMock(spec=ServerClient))
 
     def test_publish_rebinds_clients_and_clears_sessions(self, tmp_path) -> None:
-        (tmp_path / "endpoint.txt").write_text("http://new-host:8712/v1\n")
+        self._publish(tmp_path / "endpoint.txt", "http://new-host:8712/v1\n")
         server = self._make_server(tmp_path, endpoint_check_interval_s=3600.0)
         server._session_id_to_client["session-on-old-host"] = server._clients[0]
 
@@ -5218,7 +5227,7 @@ class TestEndpointFile:
         assert not server._session_id_to_client
         # Within endpoint_check_interval_s the filesystem is left alone, so a
         # fresh publish is only seen once the window is over.
-        (tmp_path / "endpoint.txt").write_text("http://newer-host:8712/v1\n")
+        self._publish(tmp_path / "endpoint.txt", "http://newer-host:8712/v1\n")
         server._maybe_rebind_endpoint()
         assert server.config.base_url == ["http://new-host:8712/v1"]
         server._endpoint_last_check_at = None  # window over: the next call re-checks
@@ -5236,13 +5245,13 @@ class TestEndpointFile:
         server._maybe_rebind_endpoint()  # absent: the clock starts, last known-good client kept
         assert server.config.base_url == ["http://placeholder:8712/v1"]
         now = 1100.0
-        endpoint_file.write_text("")  # empty is as unpublished as missing: no clock reset
+        self._publish(endpoint_file, "")  # empty is as unpublished as missing: no clock reset
         server._maybe_rebind_endpoint()
         now = 1301.0  # past the grace COUNTED FROM 1000, proving the empty write reset nothing
         with raises(RuntimeError, match="no longer published"):
             server._maybe_rebind_endpoint()
 
-        endpoint_file.write_text("http://placeholder:8712/v1\n")  # republish on the SAME host
+        self._publish(endpoint_file, "http://placeholder:8712/v1\n")  # republish on the SAME host
         now = 1301.5  # within the check window: the publish is not seen yet, the raise stays loud
         with raises(RuntimeError, match="no longer published"):
             server._maybe_rebind_endpoint()
