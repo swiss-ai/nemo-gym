@@ -355,7 +355,9 @@ class SimpleAgent(SimpleResponsesAPIAgent):
             resource_name = self.config.resources_server.name
             if resource_name in self.server_client.global_config_dict:
                 resource_config = get_first_server_config_dict(self.server_client.global_config_dict, resource_name)
-                if resource_config.get("legacy_response_usage_details_as_zero", False):
+                if resource_config.get("legacy_responses_compatibility", False) or resource_config.get(
+                    "legacy_response_usage_details_as_zero", False
+                ):
                     # Legacy verifiers echo the wire-only zero counts. Retain the
                     # model's authoritative usage when returning to the trainer.
                     result["response"]["usage"] = model_response_json.get("usage")

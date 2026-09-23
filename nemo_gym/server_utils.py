@@ -439,9 +439,33 @@ ServerStatus = Union[Literal["success"], Literal["connection_error"], Literal["t
 
 
 _LEGACY_RESPONSE_USAGE_DETAILS_AS_ZERO = "legacy_response_usage_details_as_zero"
+_LEGACY_RESPONSES_COMPATIBILITY = "legacy_responses_compatibility"
 
 
-def _coerce_legacy_remote_response_usage_details(
+def _omit_optional_response_envelope_nulls(json_obj: dict) -> dict:
+    # openai_utils imports server_utils; load the schemas only at request time.
+    from nemo_gym.openai_utils import NeMoGymResponse, NeMoGymResponseCreateParamsNonStreaming
+
+    normalized_json = json_obj.copy()
+    for envelope, schema in (
+        ("responses_create_params", NeMoGymResponseCreateParamsNonStreaming),
+        ("response", NeMoGymResponse),
+    ):
+        value = json_obj.get(envelope)
+        if not isinstance(value, dict):
+            continue
+        optional_null_fields = {
+            name for name, field in schema.model_fields.items() if not field.is_required() and field.default is None
+        }
+        # Only the typed envelope is adapted. Nested input, output, tool schemas,
+        # metadata, and unknown extension fields retain their exact contents.
+        normalized_json[envelope] = {
+            name: item for name, item in value.items() if item is not None or name not in optional_null_fields
+        }
+    return normalized_json
+
+
+def _prepare_legacy_remote_resource_payload(
     json_obj: Any,
     *,
     server_entry: Any,
@@ -449,21 +473,33 @@ def _coerce_legacy_remote_response_usage_details(
     method: str,
     url_path: str,
 ) -> Any:
-    """Copy unknown usage counts to zero only at an opted-in legacy resource boundary.
+    """Adapt copied Responses envelopes only at an opted-in legacy resource boundary.
 
-    Older remote verifiers require integer cache and reasoning counts, although
-    grading does not consume them. Keep unknown counts in the original response.
+    The full compatibility profile omits optional null request/response fields
+    that older schemas may reject, and supplies integer cache/reasoning counts
+    for verification. Remove the profile after the hosted service accepts the
+    current schemas and nullable usage details. Non-null values are never hidden
+    from remote validation. The older usage-only option remains supported.
     """
-    if not server_config_dict.get(_LEGACY_RESPONSE_USAGE_DETAILS_AS_ZERO, False):
+    legacy_protocol = server_config_dict.get(_LEGACY_RESPONSES_COMPATIBILITY, False)
+    legacy_usage = server_config_dict.get(_LEGACY_RESPONSE_USAGE_DETAILS_AS_ZERO, False)
+    if not (legacy_protocol or legacy_usage):
         return json_obj
 
     if server_entry is None or "resources_servers" not in server_entry or not server_config_dict.get("url"):
-        raise ValueError(
-            f"{_LEGACY_RESPONSE_USAGE_DETAILS_AS_ZERO} requires a remote resources_servers configuration."
-        )
+        option = _LEGACY_RESPONSES_COMPATIBILITY if legacy_protocol else _LEGACY_RESPONSE_USAGE_DETAILS_AS_ZERO
+        raise ValueError(f"{option} requires a remote resources_servers configuration.")
 
     endpoint = url_path.split("?", 1)[0].rsplit("/", 1)[-1]
-    if method != "POST" or endpoint not in {"verify", "step"} or not isinstance(json_obj, dict):
+    if (
+        method != "POST"
+        or endpoint not in {"reset", "seed_session", "verify", "step"}
+        or not isinstance(json_obj, dict)
+    ):
+        return json_obj
+    if legacy_protocol:
+        json_obj = _omit_optional_response_envelope_nulls(json_obj)
+    if endpoint not in {"verify", "step"}:
         return json_obj
     response = json_obj.get("response")
     if not isinstance(response, dict):
@@ -559,7 +595,7 @@ class ServerClient(BaseModel):
                 if server_entry is not None
                 else DictConfig({})
             )
-            json_obj = _coerce_legacy_remote_response_usage_details(
+            json_obj = _prepare_legacy_remote_resource_payload(
                 json_obj,
                 server_entry=server_entry,
                 server_config_dict=server_config_dict,

@@ -82,7 +82,9 @@ def _mock_response(payload=None, *, status=200, content="") -> MagicMock:
 
 
 class TestApp:
-    @pytest.mark.parametrize("legacy", [False, True])
+    @pytest.mark.parametrize(
+        "legacy", [None, "legacy_response_usage_details_as_zero", "legacy_responses_compatibility"]
+    )
     async def test_echoing_verifier_preserves_original_model_usage(self, monkeypatch, legacy):
         server, _ = _make_agent(False)
         server.server_client = ServerClient(
@@ -94,7 +96,7 @@ class TestApp:
                             "math": {
                                 "url": "https://legacy.example/math",
                                 "entrypoint": "app.py",
-                                "legacy_response_usage_details_as_zero": legacy,
+                                **({legacy: True} if legacy else {}),
                             }
                         }
                     },

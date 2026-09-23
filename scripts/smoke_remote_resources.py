@@ -9,6 +9,9 @@ Uses the resource selected by ``GYM_REMOTE_CHECK_TASK`` (or all three when it
 is unset). No model or local resource server is launched. This checks HTTP
 contracts, rewards, and session cookies; it does not replace a training smoke
 with a real policy model.
+
+Payloads deliberately include the modern SDK defaults, matching agent
+serialization before the explicit legacy resource compatibility adapter.
 """
 
 import asyncio
@@ -18,7 +21,7 @@ from pathlib import Path
 
 from omegaconf import OmegaConf
 
-from nemo_gym.openai_utils import NeMoGymResponse
+from nemo_gym.openai_utils import NeMoGymResponse, NeMoGymResponseCreateParamsNonStreaming
 from nemo_gym.server_utils import BaseServerConfig, ServerClient, get_global_aiohttp_client, get_response_json
 
 
@@ -44,7 +47,7 @@ def response(text: str) -> dict:
         parallel_tool_calls=False,
         tool_choice="auto",
         tools=[],
-    ).model_dump(exclude_unset=True)
+    ).model_dump()
     # vLLM can report these counts as unknown. The three remote
     # services currently require integers, so this exercises the explicit
     # transport compatibility setting in their remote configs.
@@ -73,6 +76,13 @@ async def main() -> None:
     client = ServerClient(head_server_config=BaseServerConfig(host="localhost", port=11000), global_config_dict=config)
 
     async def call(name: str, path: str, body: dict, cookies: dict[str, str]) -> dict:
+        # The agents validate and then dump the full request, including defaults.
+        # Sparse hand-written payloads would miss SDK/schema compatibility errors.
+        body = body | {
+            "responses_create_params": NeMoGymResponseCreateParamsNonStreaming.model_validate(
+                body["responses_create_params"]
+            ).model_dump()
+        }
         async with asyncio.timeout(30):
             result = await client.post(name, path, json=body, cookies=cookies)
             payload = await get_response_json(result)
@@ -86,16 +96,18 @@ async def main() -> None:
         if "math_with_judge" in selected_tasks:
             params = {"input": [{"role": "user", "content": "What is 2+2?"}]}
             for answer, reward in (("4", 1), ("5", 0)):
+                body = {
+                    "responses_create_params": params,
+                    "question": "What is 2+2?",
+                    "expected_answer": "4",
+                }
+                cookies = {}
+                await call("math_with_judge", "/seed_session", body, cookies)
                 result = await call(
                     "math_with_judge",
                     "/verify",
-                    {
-                        "responses_create_params": params,
-                        "question": "What is 2+2?",
-                        "expected_answer": "4",
-                        "response": response("\\boxed{" + answer + "}"),
-                    },
-                    {},
+                    body | {"response": response("\\boxed{" + answer + "}")},
+                    cookies,
                 )
                 assert result["reward"] == reward, result
 

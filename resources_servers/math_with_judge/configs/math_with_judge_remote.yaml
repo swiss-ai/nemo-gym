@@ -3,8 +3,8 @@ math_with_judge:
     math_with_judge:
       entrypoint: app.py
       url: https://gym-dev.swissai.svc.cscs.ch/math_with_judge
-      # Temporary wire compatibility for the deployed pre-b1e0 Gym service. Remove after it accepts null usage details.
-      legacy_response_usage_details_as_zero: true
+      # Remove after the hosted service accepts current Responses schemas and nullable usage details.
+      legacy_responses_compatibility: true
       judge_model_server:
         type: responses_api_models
         name: policy_model

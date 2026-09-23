@@ -10,6 +10,13 @@ file, and `<submit/>` to grade. The example task repairs `mathutils.py`.
 do not install or configure that service. Its deployment must provide Python,
 pytest, and git when tasks clone repositories.
 
+The remote config opts into `legacy_responses_compatibility`: outgoing resource
+requests omit optional null fields from the Responses request/response envelopes
+and encode unknown usage details as zero for verification. Original trainer
+responses, non-null options, and nested input/tool/task data are preserved.
+Remove this opt-in once the hosted service accepts the current Responses schemas
+and nullable usage details.
+
 Dataset extras supply `task`, `files`, `hidden_tests`, `test_cmd`, and `max_steps`.
 Optional `repo_url`, `commit`, and `setup_cmd` support repository tasks. Hidden
 tests are written at submission or the step limit. Reward is the pytest summary's

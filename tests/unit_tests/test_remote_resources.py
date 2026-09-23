@@ -11,6 +11,7 @@ from pydantic import BaseModel
 import nemo_gym.cli.env
 import nemo_gym.server_utils
 from nemo_gym.cli.env import RunHelper
+from nemo_gym.openai_utils import NeMoGymResponse, NeMoGymResponseCreateParamsNonStreaming
 from nemo_gym.server_utils import (
     NEMO_GYM_MODEL_SERVER_BASE_URL_ENV_VAR_NAME,
     NEMO_GYM_MODEL_SERVER_NAME_ENV_VAR_NAME,
@@ -19,12 +20,14 @@ from nemo_gym.server_utils import (
 )
 
 
-def _client(*, url="https://gym.example/math/", legacy=False, server_type="resources_servers"):
+def _client(*, url="https://gym.example/math/", legacy=False, legacy_protocol=False, server_type="resources_servers"):
     config = {"entrypoint": "app.py", "host": "localhost", "port": 9000}
     if url is not None:
         config["url"] = url
     if legacy:
         config["legacy_response_usage_details_as_zero"] = True
+    if legacy_protocol:
+        config["legacy_responses_compatibility"] = True
     return ServerClient(
         head_server_config=BaseServerConfig(host="localhost", port=8000),
         global_config_dict=OmegaConf.create({"remote": {server_type: {"math": config}}}),
@@ -40,6 +43,143 @@ def _unknown_usage():
             }
         }
     }
+
+
+def _modern_resource_payload():
+    params = NeMoGymResponseCreateParamsNonStreaming(input="question").model_dump()
+    response = NeMoGymResponse(
+        id="response-1",
+        created_at=1.0,
+        model="model",
+        object="response",
+        output=[],
+        parallel_tool_calls=True,
+        tool_choice="auto",
+        tools=[],
+    ).model_dump()
+    return {"responses_create_params": params, "response": response, "task_metadata": {"nullable": None}}
+
+
+@pytest.mark.parametrize("url_path", ["/reset", "/seed_session", "/verify", "/step", "/ng-rollout/7-0/reset?x=1"])
+@pytest.mark.parametrize("as_model", [False, True])
+async def test_legacy_protocol_omits_optional_envelope_nulls_without_touching_task_data(
+    monkeypatch, url_path, as_model
+):
+    class Payload(BaseModel):
+        responses_create_params: dict
+        response: dict
+        task_metadata: dict
+
+    payload = _modern_resource_payload()
+    params = payload["responses_create_params"]
+    rejected_fields = {
+        "context_management",
+        "conversation",
+        "moderation",
+        "prompt_cache_key",
+        "prompt_cache_retention",
+        "safety_identifier",
+        "stream_options",
+    }
+    assert all(params[name] is None for name in rejected_fields)
+    params["input"] = [{"role": "user", "content": [{"type": "input_text", "text": "question", "nullable": None}]}]
+    params["tools"] = [{"type": "function", "name": "tool", "parameters": {"properties": {"x": {"default": None}}}}]
+    params["metadata"] = {"nullable": None}
+    params["unknown_extension"] = None
+    payload["response"]["output"] = [{"type": "custom", "data": {"nullable": None}}]
+    payload["response"]["unknown_extension"] = None
+    original = deepcopy(payload)
+    if as_model:
+        payload = Payload.model_validate(payload)
+    request = AsyncMock()
+    monkeypatch.setattr(nemo_gym.server_utils, "request", request)
+
+    await _client(legacy_protocol=True).post("remote", url_path, json=payload)
+
+    wire = request.await_args.kwargs["json"]
+    assert not rejected_fields.intersection(wire["responses_create_params"])
+    assert "usage" not in wire["response"]
+    for name in ("input", "tools", "metadata", "unknown_extension"):
+        assert wire["responses_create_params"][name] == original["responses_create_params"][name]
+    assert wire["response"]["output"] == original["response"]["output"]
+    assert wire["response"]["unknown_extension"] is None
+    assert wire["task_metadata"] == {"nullable": None}
+    assert (payload.model_dump() if as_model else payload) == original
+
+
+async def test_legacy_protocol_preserves_nonnull_and_falsy_response_fields(monkeypatch):
+    params = {
+        "input": [],
+        "context_management": [],
+        "conversation": "conversation-1",
+        "moderation": {},
+        "prompt_cache_key": "",
+        "prompt_cache_retention": "24h",
+        "safety_identifier": "safe",
+        "stream_options": {},
+        "temperature": 0,
+        "store": False,
+    }
+    payload = {"responses_create_params": params, "response": {"output": [], "parallel_tool_calls": False}}
+    original = deepcopy(payload)
+    request = AsyncMock()
+    monkeypatch.setattr(nemo_gym.server_utils, "request", request)
+
+    await _client(legacy_protocol=True).post("remote", "/verify", json=payload)
+
+    assert request.await_args.kwargs["json"] == original
+    assert payload == original
+
+
+@pytest.mark.parametrize(
+    "client_args,method,url_path",
+    [
+        ({}, "POST", "/verify"),
+        ({"legacy": True}, "POST", "/verify"),
+        ({"url": None}, "POST", "/reset"),
+        ({"server_type": "responses_api_models"}, "POST", "/v1/responses"),
+        ({"legacy_protocol": True}, "GET", "/verify"),
+        ({"legacy_protocol": True}, "POST", "/custom_tool"),
+    ],
+)
+async def test_legacy_protocol_does_not_change_current_servers_or_other_calls(
+    monkeypatch, client_args, method, url_path
+):
+    payload = _modern_resource_payload()
+    original = deepcopy(payload)
+    request = AsyncMock()
+    monkeypatch.setattr(nemo_gym.server_utils, "request", request)
+
+    await _client(**client_args).request("remote", url_path, method, json=payload)
+
+    assert request.await_args.kwargs["json"] == original
+    assert payload == original
+
+
+async def test_legacy_protocol_preserves_required_null_fields_for_remote_validation(monkeypatch):
+    payload = {"responses_create_params": {"input": None, "conversation": None}}
+    request = AsyncMock()
+    monkeypatch.setattr(nemo_gym.server_utils, "request", request)
+
+    await _client(legacy_protocol=True).post("remote", "/reset", json=payload)
+
+    assert request.await_args.kwargs["json"] == {"responses_create_params": {"input": None}}
+    assert payload == {"responses_create_params": {"input": None, "conversation": None}}
+
+
+@pytest.mark.parametrize(
+    "url,server_type", [(None, "resources_servers"), ("https://model.example", "responses_api_models")]
+)
+async def test_legacy_protocol_rejects_non_remote_resource_configuration(monkeypatch, url, server_type):
+    request = AsyncMock()
+    monkeypatch.setattr(nemo_gym.server_utils, "request", request)
+
+    with pytest.raises(ValueError, match="requires a remote resources_servers configuration"):
+        await _client(url=url, legacy_protocol=True, server_type=server_type).post(
+            "remote", "/reset", json=_modern_resource_payload()
+        )
+
+    request.assert_not_awaited()
 
 
 @pytest.mark.parametrize("url", ["https://gym.example/math", "https://gym.example/math/"])
