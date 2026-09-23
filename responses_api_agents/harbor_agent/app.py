@@ -336,6 +336,15 @@ class HarborAgent(SimpleResponsesAPIAgent):
                 response=response,
                 instance_id=instance_id,
                 metadata=trial_result if trial_result else {},
+                # A rollout with no output items produced no trainable token at
+                # all -- the trial died during environment setup, blew the
+                # context window on the first turn, or `run()` above fell through
+                # to its except branch. There is nothing to learn from it, and a
+                # single one otherwise aborts the whole training step. Flag it so
+                # the trainer can drop it from the gradient instead; NeMo-RL
+                # reads this exact path (instance_config.mask_sample), which is
+                # also how anyswe_agent reports sandbox failures.
+                instance_config={"mask_sample": not output_items},
                 context_length_exceeded_error=int(agent_error_flags.get("context_length_exceeded", False)),
                 memory_limit_exceeded_error=int(agent_error_flags.get("memory_limit_exceeded", False)),
                 agent_timeout_error=int(
