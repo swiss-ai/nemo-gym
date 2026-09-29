@@ -335,7 +335,15 @@ class SingularityEnvironment(BaseEnvironment):
                 f"{self.trial_paths.agent_dir}:{EnvironmentPaths.agent_dir}",
             ]
             if env_files_dir.exists():
-                bind_mounts.extend(["-B", f"{env_files_dir}:/staging/env_files"])
+                # Read-only: this is the task's own directory in the dataset, not
+                # a per-trial copy (trial.py passes task.paths.environment_dir
+                # straight through), and many trials of the same task run
+                # concurrently against it. A write from inside the sandbox would
+                # corrupt that task's inputs for every later rollout, silently and
+                # irreversibly. Copying into the workdir is setup.sh's job, and it
+                # only ever reads from here. Mutating those copies stays allowed,
+                # matching the `COPY files/ /app/` this stands in for.
+                bind_mounts.extend(["-B", f"{env_files_dir}:/staging/env_files:ro"])
             # --no-mount: default home,tmp,bind-paths so host $HOME is not mounted
             # (avoid altering host .bashrc/.bash_profile). Override via
             # harbor_environment_kwargs singularity_no_mount (use "" to allow all mounts).
