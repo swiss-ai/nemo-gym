@@ -71,6 +71,19 @@ harbor_agent:
         kubeconfig: null
         context: null
 
+      # Delete each sandbox pod once its trial finishes.
+      #
+      # Overridden from the app default of true, which exists so the Docker
+      # backend can keep runtime images between trials. That trade is wrong
+      # here: a pod is not a cached image, it is a running reservation of the
+      # cluster's CPU and memory. Left at true, Trial._cleanup_and_finalize
+      # calls stop(delete=False) and KubernetesEnvironment.stop returns without
+      # deleting anything, so every rollout leaks a pod. Free capacity then only
+      # falls -- one step's finished pods starve the next step's pods into
+      # Pending until they time out, and a run keeps reporting healthy while
+      # training on nothing.
+      harbor_no_delete: false
+
       # Model routing: points agent LLM calls at the NeMo Gym model server alias.
       model_server:
         type: responses_api_models
