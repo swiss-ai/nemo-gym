@@ -46,6 +46,7 @@ from nemo_gym.sandbox import (
     resolve_provider_metadata,
     rewrite_image,
 )
+from nemo_gym.sandbox.utils import cpu_cap_env
 
 
 # The sandbox-side scratch directory used for tar-based directory transfer.
@@ -84,6 +85,12 @@ class NemoGymSandboxEnvironment(BaseEnvironment):
             to the provider, e.g. ``resource_requests`` to schedule sandboxes
             below their resource limits.
         sandbox_env: Extra environment variables set in the sandbox.
+        derive_cpu_env: Set the CPU_CAP_ENV_VARS thread/worker caps
+            (``OMP_NUM_THREADS``, ``PYTEST_XDIST_AUTO_NUM_WORKERS``, ...) to
+            the sandbox's CPU limit (default False). Containers see the host's
+            full core count, so test runners and BLAS pools otherwise fan out
+            far past the limit and get throttled or group-OOM killed. Entries
+            in ``sandbox_env`` win over the derived caps.
         sandbox_ttl_s: Sandbox server-side TTL safety net (default 21600).
         sandbox_ready_timeout_s: Create/readiness timeout incl. image pull
             (default 900).
@@ -121,6 +128,7 @@ class NemoGymSandboxEnvironment(BaseEnvironment):
         sandbox_metadata: Optional[Mapping[str, Any]] = None,
         sandbox_provider_options: Optional[Mapping[str, Any]] = None,
         sandbox_env: Optional[Mapping[str, str]] = None,
+        derive_cpu_env: bool = False,
         sandbox_ttl_s: Optional[float] = 21600,
         sandbox_ready_timeout_s: Optional[float] = 900,
         default_exec_timeout_s: Optional[float] = 1800,
@@ -137,6 +145,7 @@ class NemoGymSandboxEnvironment(BaseEnvironment):
         self._sandbox_metadata = dict(sandbox_metadata or {})
         self._sandbox_provider_options = dict(sandbox_provider_options or {})
         self._sandbox_env = {str(k): str(v) for k, v in dict(sandbox_env or {}).items()}
+        self._derive_cpu_env = derive_cpu_env
         self._sandbox_ttl_s = sandbox_ttl_s
         self._sandbox_ready_timeout_s = sandbox_ready_timeout_s
         self._default_exec_timeout_s = default_exec_timeout_s
@@ -218,7 +227,7 @@ class NemoGymSandboxEnvironment(BaseEnvironment):
             ttl_s=self._sandbox_ttl_s,
             ready_timeout_s=self._sandbox_ready_timeout_s,
             workdir=self._workdir,
-            env=self._sandbox_env,
+            env={**(cpu_cap_env(resources.get("cpu")) if self._derive_cpu_env else {}), **self._sandbox_env},
             metadata=metadata,
             resources=resources,
             provider_options=dict(self._sandbox_provider_options),

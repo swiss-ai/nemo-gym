@@ -351,6 +351,7 @@ class TestApp:
 
         assert response.reward == 1.0
         assert len(response.response.output) == 6
+        assert response.instance_config == {"mask_sample": False}
 
         msg0, msg3 = response.response.output[0], response.response.output[3]
         assert msg0.prompt_token_ids == [100, 101, 102]
@@ -441,6 +442,8 @@ class TestApp:
 
         assert response.reward == 0.0
         assert len(response.response.output) == 0
+        # No output items -> nothing trainable; flagged so the trainer masks it.
+        assert response.instance_config == {"mask_sample": True}
         assert response.responses_create_params.temperature == 0.3
         assert response.responses_create_params.input == []
 

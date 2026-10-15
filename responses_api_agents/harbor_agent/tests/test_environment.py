@@ -183,6 +183,23 @@ class TestStartStop:
         assert resources.disk_gib == 30
 
     @pytest.mark.asyncio
+    async def test_start_derives_cpu_cap_env_from_cpu_limit(self, tmp_path):
+        env = _make_environment(tmp_path, derive_cpu_env=True, sandbox_env={"OMP_NUM_THREADS": "1", "FOO": "bar"})
+        await env.start(force_build=False)
+        spec_env = _provider().created_specs[0].env
+        # The task's cpus=4 caps every fan-out knob; explicit sandbox_env wins.
+        assert spec_env["PYTEST_XDIST_AUTO_NUM_WORKERS"] == "4"
+        assert spec_env["OPENBLAS_NUM_THREADS"] == "4"
+        assert spec_env["OMP_NUM_THREADS"] == "1"
+        assert spec_env["FOO"] == "bar"
+
+    @pytest.mark.asyncio
+    async def test_start_does_not_derive_cpu_cap_env_by_default(self, tmp_path):
+        env = _make_environment(tmp_path, sandbox_env={"FOO": "bar"})
+        await env.start(force_build=False)
+        assert _provider().created_specs[0].env == {"FOO": "bar"}
+
+    @pytest.mark.asyncio
     async def test_start_applies_image_rewrites(self, tmp_path):
         env = _make_environment(
             tmp_path,
