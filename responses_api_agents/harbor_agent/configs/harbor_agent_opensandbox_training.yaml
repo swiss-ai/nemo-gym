@@ -1,0 +1,110 @@
+# Harbor agent for RL training (e.g. NeMo-RL GRPO), with task containers on a
+# remote OpenSandbox cluster.
+#
+# Training sibling of harbor_agent_opensandbox.yaml (Terminal-Bench 2.1 eval):
+# same environment class, but no benchmark dataset is wired in -- the trainer
+# supplies the rows and deep-merges its own `harbor_datasets` alias -- and the
+# Terminus-2 bridge returns the per-token ids/logprobs training needs.
+#
+# Use together with the provider config, which defines `sandbox`:
+#
+#   config_paths:
+#   - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+#   - nemo_gym/sandbox/providers/opensandbox/configs/opensandbox.yaml
+#   - responses_api_agents/harbor_agent/configs/harbor_agent_opensandbox_training.yaml
+#
+# Requires OPENSANDBOX_DOMAIN and OPENSANDBOX_API_KEY (see the provider config).
+# Every task.toml must set [environment].docker_image to an image the
+# OpenSandbox cluster can pull: Harbor-side Dockerfile builds are not supported.
+harbor_agent:
+  responses_api_agents:
+    harbor_agent:
+      entrypoint: app.py
+      domain: agent
+      description: Harbor integration for agent harnesses and environments.
+      value: Improve models in popular agentic environments supported by Harbor such as Terminus2.
+      # One sandbox per in-flight rollout; the trainer sets this to its step size.
+      concurrency: 32
+      # Jobs are I/O-bound, so reserve a fraction of a CPU each; Ray's default
+      # of 1 CPU/task would cap them at the driver's CPU count.
+      harbor_ray_task_num_cpus: 0.25
+
+      # Filled in by the trainer: `<alias>: {local_dataset_path: ...}`, where
+      # <alias> is the left half of every row's `<alias>::<task_name>` id.
+      harbor_datasets: {}
+
+      harbor_agent_name: null
+      harbor_agent_import_path: "responses_api_agents.harbor_agent.custom_agents.terminus_2_nemo_gym:Terminus2NemoGym"
+      harbor_agent_kwargs:
+        max_turns: 20
+        interleaved_thinking: true
+        # Off for RL: summarisation would ask the model to compress its own
+        # context mid-trajectory, which is not behaviour we want to train.
+        enable_summarize: false
+        # Required for RL. Without it the bridge returns trajectories with no
+        # generation_token_ids and every rollout is untrainable.
+        collect_rollout_details: true
+        trajectory_config:
+          raw_content: true
+        # The 120s default times out and re-sends under training load, piling
+        # zombie requests on the policy server.
+        nemo_model_server_timeout_sec: 2400
+        model_info:
+          max_input_tokens: 32768
+          max_output_tokens: 32768
+          input_cost_per_token: 0.0
+          output_cost_per_token: 0.0
+
+      harbor_environment_type: null
+      harbor_environment_import_path: "responses_api_agents.harbor_agent.custom_envs.nemo_gym_sandbox.environment:NemoGymSandboxEnvironment"
+      harbor_environment_kwargs:
+        # The `sandbox` block from the included provider config.
+        sandbox_provider: ${sandbox}
+        sandbox_metadata:
+          harbor-workload: training
+        sandbox_provider_options:
+          # Schedule well below the limits (each task.toml's cpus/memory_mb):
+          # agent sandboxes idle most of the time, and requests equal to the
+          # limits strand cluster capacity and leave other tenants Pending.
+          resource_requests:
+            cpu: 0.5
+            memory_mib: 512
+          platform:
+            os: linux
+            arch: amd64
+        # Cap test runners and BLAS pools at the task's CPU limit; sandboxes
+        # otherwise see the host's full core count and fan out until OOM.
+        derive_cpu_env: true
+        sandbox_env:
+          # Per-command latency floor of the exec daemon (default 1s).
+          EXECD_API_GRACE_SHUTDOWN: 50ms
+        # Server-side safety net, above the longest trial; the timeouts below
+        # bound trials.
+        sandbox_ttl_s: 21600
+        # Create + readiness incl. image pull; must stay below the provider's
+        # create.timeout_s (1500).
+        sandbox_ready_timeout_s: 1200
+        # Per-command bound for every exec that carries no timeout of its own,
+        # including Harbor's verifier. Keep it above every task's verifier
+        # timeout_sec, or verification is silently truncated and scores 0.
+        default_exec_timeout_s: 3600
+        cpu_pin_enabled: false
+
+      model_server:
+        type: responses_api_models
+        name: policy_model
+
+      harbor_agent_override_timeout: null
+      harbor_agent_max_timeout: null
+      harbor_verifier_override_timeout: null
+      harbor_verifier_max_timeout: null
+      harbor_timeout_multiplier: null
+      harbor_jobs_dir: "responses_api_agents/harbor_agent/jobs"
+
+harbor_agent_environment_server:
+  environment_servers:
+    legacy_agent:
+      entrypoint: app.py
+      agent_server:
+        type: responses_api_agents
+        name: harbor_agent
