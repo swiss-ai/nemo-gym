@@ -636,6 +636,9 @@ class OpenSandboxProviderOptions:
     snapshot_id: str | None = None
     volumes: tuple[Mapping[str, Any], ...] = ()
     skip_health_check: bool | None = None
+    # Clusters may install a ValidatingAdmissionPolicy that rejects every create
+    # without secureAccess, so this has to be settable per deployment.
+    secure_access: bool | None = None
     extensions: Mapping[str, str] = field(default_factory=dict)
     # Scheduling requests use SandboxSpec.resources keys. "limits" explicitly
     # mirrors each sandbox's limits; omission leaves defaulting to the server.
@@ -674,6 +677,9 @@ class OpenSandboxProviderOptions:
         skip_health_check = options.get("skip_health_check")
         if skip_health_check is not None and not isinstance(skip_health_check, bool):
             raise TypeError("OpenSandbox provider option 'skip_health_check' must be a bool")
+        secure_access = options.get("secure_access")
+        if secure_access is not None and not isinstance(secure_access, bool):
+            raise TypeError("OpenSandbox provider option 'secure_access' must be a bool")
         extensions = options.get("extensions", {})
         if not isinstance(extensions, Mapping):
             raise TypeError("OpenSandbox provider option 'extensions' must be a mapping")
@@ -692,6 +698,7 @@ class OpenSandboxProviderOptions:
             snapshot_id=snapshot_id,
             volumes=tuple(dict(volume) for volume in volumes),
             skip_health_check=skip_health_check,
+            secure_access=secure_access,
             extensions=_string_map(dict(extensions)),
             resource_requests=dict(resource_requests) if isinstance(resource_requests, Mapping) else resource_requests,
         )
@@ -1516,6 +1523,8 @@ class OpenSandboxProvider:
             kwargs["image"] = _to_image_spec(spec.image, options.image_auth)
         if options.snapshot_id is not None:
             kwargs["snapshot_id"] = options.snapshot_id
+        if options.secure_access is not None:
+            kwargs["secure_access"] = options.secure_access
         if spec.ttl_s is not None:
             kwargs["timeout"] = timedelta(seconds=spec.ttl_s)
         if spec.ready_timeout_s is not None:

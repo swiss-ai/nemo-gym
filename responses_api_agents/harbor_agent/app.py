@@ -24,6 +24,7 @@ from uuid import uuid4
 
 import ray
 from fastapi import Body, FastAPI
+from omegaconf import OmegaConf
 from pydantic import BaseModel, ConfigDict
 
 from nemo_gym.base_resources_server import (
@@ -36,6 +37,7 @@ from nemo_gym.base_responses_api_agent import (
 )
 from nemo_gym.config_types import ModelServerRef
 from nemo_gym.global_config import (
+    NEMO_GYM_CONFIG_DICT_ENV_VAR_NAME,
     get_first_server_config_dict,
     get_global_config_dict,
 )
@@ -213,6 +215,34 @@ def runner_ray_remote(runner: Callable, params: dict[str, Any]) -> Any:
     return runner(**params)
 
 
+_RAY_TASK_RUNTIME_ENV: Optional[dict[str, Any]] = None
+
+
+def _ray_task_runtime_env() -> dict[str, Any]:
+    """Runtime env for the Ray task that executes one Harbor trial.
+
+    A Ray worker starts with no NeMo Gym global config, and Gym resolves it
+    lazily on first use -- including inside ``server_utils.request``, which the
+    sandbox providers' HTTP transport goes through. In a worker that lookup
+    falls through to a full Hydra CLI parse of ``sys.argv``, which is Ray's
+    ``default_worker.py ...`` argv, so Hydra's argparse calls ``sys.exit(2)``.
+    Harbor catches ``Exception``, not ``SystemExit``, so the trial dies in
+    environment setup with a null ``exception_info`` and no traceback.
+
+    Shipping the already-resolved config lets ``maybe_get_global_config_dict``
+    short-circuit in the worker, so Hydra is never reached. The value is
+    constant for the life of the server, so caching it keeps every task on one
+    runtime-env hash and lets Ray reuse workers.
+    """
+    global _RAY_TASK_RUNTIME_ENV
+    if _RAY_TASK_RUNTIME_ENV is None:
+        _RAY_TASK_RUNTIME_ENV = {
+            "py_executable": sys.executable,
+            "env_vars": {NEMO_GYM_CONFIG_DICT_ENV_VAR_NAME: OmegaConf.to_yaml(get_global_config_dict())},
+        }
+    return _RAY_TASK_RUNTIME_ENV
+
+
 class HarborAgent(SimpleResponsesAPIAgent):
     ray_enabled = True
     config: HarborAgentConfig
@@ -272,9 +302,10 @@ class HarborAgent(SimpleResponsesAPIAgent):
                 params = dict(
                     job_config_dict=job_config_dict,
                 )
-                runner = runner_ray_remote
+                runner_options: dict[str, Any] = {"runtime_env": _ray_task_runtime_env()}
                 if self.config.harbor_ray_task_num_cpus is not None:
-                    runner = runner_ray_remote.options(num_cpus=self.config.harbor_ray_task_num_cpus)
+                    runner_options["num_cpus"] = self.config.harbor_ray_task_num_cpus
+                runner = runner_ray_remote.options(**runner_options)
                 future = runner.remote(_run_harbor_job_sync, params)
                 # Await the ObjectRef directly; to_thread(ray.get, ...) would pin
                 # one executor thread per in-flight trial, so completed trials
