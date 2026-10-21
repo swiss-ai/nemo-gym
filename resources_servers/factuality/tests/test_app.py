@@ -390,6 +390,21 @@ async def test_task_index_reaches_group_stats(tmp_path) -> None:
     assert rec["groups"] == 1 and rec["zero_variance_group_share"] == 1.0
 
 
+async def test_validation_rows_stay_out_of_windows_and_guard(tmp_path) -> None:
+    case = next(c for c in CASES if c["case"] == "idk")
+    cfg = _config(
+        stats=StatsConfig(window_rollouts=1, path=str(tmp_path / "s.jsonl")),
+        guard=GuardConfig(enabled=True, max_abstain_rate=0.5),
+    )
+    server, _, _ = _server(cfg, case["judge"] * 3)
+    for _ in range(2):  # 100% abstain on validation: graded, no window, no trip
+        res = await server.verify(_request(case, split="validation"))
+        assert res.outcome == "abstain" and res.split == "validation"
+    assert not (tmp_path / "s.jsonl").exists() and not server._windows.tripped
+    await server.verify(_request(case, split="train"))  # a training row still closes a window
+    assert json.loads((tmp_path / "s.jsonl").read_text())["window"] == 0 and server._windows.tripped
+
+
 def test_strip_thinking_variants() -> None:
     from resources_servers.factuality.reply import strip_thinking
 

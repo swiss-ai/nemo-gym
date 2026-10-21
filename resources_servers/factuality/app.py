@@ -22,7 +22,8 @@ swiss-ai/factuality-sft-data ``src/evals``; provenance in ``factuality_grading/V
 * **Per-window rates and an abstain guard.** Every numeric field of the verify response is averaged
   per step by NeMo RL (``train/<agent>/<field>/mean`` in W&B). In addition the server writes one line
   per window of ``stats.window_rollouts`` rollouts (= one generation batch) to ``stats.path`` and,
-  if ``guard.enabled``, stops the run when the abstain rate jumps (see ``GuardConfig``).
+  if ``guard.enabled``, stops the run when the abstain rate jumps (see ``GuardConfig``). Rows with
+  ``split: validation`` are left out of the windows and the guard.
 """
 
 from __future__ import annotations
@@ -164,6 +165,9 @@ class FactualityRunRequest(BaseRunRequest):
     kind: Optional[str] = None  # rubric override (crepe_false_premise, crepe_sound, ambiguous)
     meta: Optional[Union[Dict[str, Any], str]] = None
     gold_readings: Optional[List[Dict[str, Any]]] = None
+    # "validation" rows are graded and rewarded as usual but kept out of the stats windows and the guard,
+    # so a window stays one training generation batch.
+    split: Optional[str] = None
 
 
 class FactualityVerifyRequest(FactualityRunRequest, BaseVerifyRequest):
@@ -484,7 +488,8 @@ class FactualityServer(SimpleResourcesServer):
             judge_failed=float(failed),
             instance_config={"mask_sample": True} if failed else None,
         )
-        self._windows.add(outcome, reward, reply_tokens, task_index)
+        if body.split != "validation":
+            self._windows.add(outcome, reward, reply_tokens, task_index)
         return response
 
 
