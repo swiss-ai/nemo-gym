@@ -138,6 +138,11 @@ class FactualityConfig(BaseResourcesServerConfig):
     judge_retry_temperature: float = 0.7
     judge_error_backoff_s: float = 2.0
     judge_max_concurrency: int = 256
+    # Until the judge has answered once, judge calls that fail (e.g. the judge vLLM is still loading) are retried every
+    # judge_startup_poll_s for up to judge_startup_wait_s instead of counting as judge failures. Lets training set up
+    # while the judge loads. 0 = no wait (a judge that is down at the first call fails as usual).
+    judge_startup_wait_s: float = 0.0
+    judge_startup_poll_s: float = 15.0
 
     reward: RewardConfig = Field(default_factory=RewardConfig)
     # "any": every rollout that hit max_output_tokens gets the truncation value (default; a cut-off
@@ -388,6 +393,8 @@ class FactualityServer(SimpleResourcesServer):
     config: FactualityConfig
     _judge_sem: asyncio.Semaphore = PrivateAttr()
     _windows: RateWindows = PrivateAttr()
+    _judge_up: bool = PrivateAttr(default=False)
+    _judge_wait_logged: bool = PrivateAttr(default=False)
 
     def model_post_init(self, context: Any) -> None:
         super().model_post_init(context)
@@ -402,6 +409,29 @@ class FactualityServer(SimpleResourcesServer):
         )
 
     async def _call_judge(self, prompt: str, temperature: float, max_tokens: int) -> str:
+        deadline = time.monotonic() + self.config.judge_startup_wait_s
+        while True:
+            try:
+                text = await self._call_judge_once(prompt, temperature, max_tokens)
+            except Exception as e:  # noqa: BLE001 - only retried before the judge has ever answered
+                if self._judge_up or time.monotonic() >= deadline:
+                    raise
+                if not self._judge_wait_logged:
+                    self._judge_wait_logged = True
+                    print(
+                        f"[factuality] judge not answering yet ({type(e).__name__}: {str(e)[:200]}); retrying every "
+                        f"{self.config.judge_startup_poll_s:.0f} s for up to {self.config.judge_startup_wait_s:.0f} s",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                await asyncio.sleep(self.config.judge_startup_poll_s)
+                continue
+            if not self._judge_up:
+                self._judge_up = True
+                print("[factuality] judge answering", file=sys.stderr, flush=True)
+            return text
+
+    async def _call_judge_once(self, prompt: str, temperature: float, max_tokens: int) -> str:
         params = self.config.judge_responses_create_params.model_copy(deep=True)
         params.input = [NeMoGymEasyInputMessage(role="user", content=prompt)]
         params.temperature = temperature

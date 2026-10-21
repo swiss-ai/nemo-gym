@@ -390,6 +390,24 @@ async def test_task_index_reaches_group_stats(tmp_path) -> None:
     assert rec["groups"] == 1 and rec["zero_variance_group_share"] == 1.0
 
 
+async def test_judge_startup_wait_retries_until_the_judge_answers() -> None:
+    case = next(c for c in CASES if c["case"] == "plain_correct")
+    cfg = _config(judge_startup_wait_s=5.0, judge_startup_poll_s=0.0)
+    server, prompts, _ = _server(cfg, [{"error": "raise"}, {"error": 502}] + case["judge"])
+    res = await server.verify(_request(case))
+    assert res.outcome == "correct" and res.judge_attempts == 1 and len(prompts) == 3 and server._judge_up
+
+
+async def test_judge_startup_wait_gives_up_after_the_deadline_and_not_after_first_answer() -> None:
+    case = next(c for c in CASES if c["case"] == "plain_correct")
+    server, _, _ = _server(_config(judge_startup_wait_s=0.0), [{"error": "raise"}] * 3)
+    assert (await server.verify(_request(case))).outcome == "judge_failed"  # no wait configured
+    cfg = _config(judge_startup_wait_s=5.0, judge_startup_poll_s=0.0)
+    server, prompts, _ = _server(cfg, case["judge"] + [{"error": "raise"}] * 3)
+    await server.verify(_request(case))  # judge is up from here on
+    assert (await server.verify(_request(case))).outcome == "judge_failed" and len(prompts) == 4
+
+
 async def test_validation_rows_stay_out_of_windows_and_guard(tmp_path) -> None:
     case = next(c for c in CASES if c["case"] == "idk")
     cfg = _config(
