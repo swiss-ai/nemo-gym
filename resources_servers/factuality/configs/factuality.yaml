@@ -1,0 +1,82 @@
+# Factuality environment (swiss-ai #1011): the factuality eval grader as the reward.
+# Closed-book (NQ) and grounded (SQuAD 2.0) QA; rubric -> LLM judge -> strict parser -> label + hedged,
+# mapped to a reward by the values below. All reward values are configuration: undecided until the
+# 2026-10-22 meeting; these are the brief's defaults (correct +1 / abstain 0 / wrong -1, truncation = min).
+
+factuality:
+  resources_servers:
+    factuality:
+      entrypoint: app.py
+      domain: knowledge
+      verified: false
+      description: Closed-book and grounded factual QA with abstention; reward is the factuality eval grader (LLM judge, five outcomes)
+      value: Teach the policy to answer what it knows, abstain on what it doesn't, and never loop
+
+      # LLM judge (Qwen3.8-27B on its own vLLM, thinking off per request). Never the policy server:
+      # NeMo RL's vLLM rejects sampling settings that differ from training.
+      judge_model_server:
+        type: responses_api_models
+        name: judge_model
+      judge_responses_create_params:
+        input: []
+        temperature: 0.0
+        top_p: 1.0
+      judge_max_tokens: 256
+      judge_retries: 2
+      judge_retry_temperature: 0.7
+      judge_error_backoff_s: 2.0
+      judge_max_concurrency: 256
+
+      reward:
+        correct: 1.0
+        hedged_correct: 1.0
+        abstain: 0.0
+        hedged_wrong: -1.0
+        confident_wrong: -1.0
+        truncated: null          # null = min of the five values (minus length_coef)
+        judge_failure: null      # null = abstain value; the sample is masked from the loss anyway
+        length_coef: 0.0         # reward -= length_coef * min(1, reply_tokens / length_norm_tokens)
+        length_norm_tokens: 1024
+        outside_answer_correct: 0.0
+        outside_answer_incorrect: 0.0
+        outside_answer_ungraded: 0.0
+
+      truncation_rule: any       # any | no_answer (the eval harness's rule)
+
+      stats:
+        window_rollouts: 0       # set to num_prompts_per_step * num_generations_per_prompt in training
+        path: null
+      guard:
+        enabled: false
+        max_abstain_rate: 0.8
+        max_abstain_jump: 0.25
+
+# The judge: Qwen3.8-27B on its own vLLM (judge_server.sbatch), thinking off per request.
+# Set judge_base_url / judge_model_name (and judge_api_key) at launch, or override this block.
+judge_model:
+  responses_api_models:
+    vllm_model:
+      entrypoint: app.py
+      base_url: ${judge_base_url}
+      api_key: ${judge_api_key}
+      model: ${judge_model_name}
+      return_token_id_information: false
+      uses_reasoning_parser: true
+      extra_body:
+        chat_template_kwargs:
+          enable_thinking: false
+
+factuality_simple_agent:
+  responses_api_agents:
+    simple_agent:
+      entrypoint: app.py
+      resources_server:
+        type: resources_servers
+        name: factuality
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      datasets:
+        - name: example
+          type: example
+          jsonl_fpath: resources_servers/factuality/data/example.jsonl

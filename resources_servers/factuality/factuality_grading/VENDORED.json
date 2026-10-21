@@ -1,0 +1,17 @@
+{
+  "source_repo": "swiss-ai/factuality-sft-data",
+  "source_commit": "94d7aed3fd4570496b8462e459f281c074543cb8",
+  "source_dirty": false,
+  "harness_version": "1.9",
+  "judge_prompt_version": "judge_v1-f4696229",
+  "files": {
+    "grader.py": {
+      "source_path": "src/evals/grader.py",
+      "sha256": "2906577bb08caab7fec97e2bc476b749cb483ae2d7123713f47152d124f279db"
+    },
+    "data.py": {
+      "source_path": "src/evals/data.py",
+      "sha256": "c7144d03fd5ed1bbc9852d5e3e12bf377a36d660ec40d76f95475a09313c82d7"
+    }
+  }
+}
