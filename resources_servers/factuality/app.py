@@ -24,6 +24,9 @@ swiss-ai/factuality-sft-data ``src/evals``; provenance in ``factuality_grading/V
   per window of ``stats.window_rollouts`` rollouts (= one generation batch) to ``stats.path`` and,
   if ``guard.enabled``, stops the run when the abstain rate jumps (see ``GuardConfig``). Rows with
   ``split: validation`` are left out of the windows and the guard.
+* **Abstention style** (heuristic, no effect on the reward): abstentions are tagged deflection / not_in_document /
+  idk / empty / other (``reply.abstain_style``), as ``abstain_style`` and ``is_abstain_deflection`` /
+  ``is_abstain_idk`` per rollout and as counts per window, so a policy that learns to deflect shows up per step.
 """
 
 from __future__ import annotations
@@ -54,7 +57,7 @@ from nemo_gym.openai_utils import (
 )
 from resources_servers.factuality.factuality_grading import VENDORED, grader
 from resources_servers.factuality.factuality_grading import data as fdata
-from resources_servers.factuality.reply import strip_thinking
+from resources_servers.factuality.reply import ABSTAIN_STYLES, abstain_style, strip_thinking
 
 
 GRADER_VERSION = (
@@ -304,15 +307,20 @@ class RateWindows:
 
     def _reset(self) -> None:
         self.counts: Counter = Counter()
+        self.styles: Counter = Counter()
         self.rewards: List[float] = []
         self.tokens: List[int] = []
         self.groups: Dict[Any, List[float]] = defaultdict(list)
         self.t0 = time.time()
 
-    def add(self, outcome: str, reward: float, reply_tokens: Optional[int], task_index: Any) -> Optional[dict]:
+    def add(
+        self, outcome: str, reward: float, reply_tokens: Optional[int], task_index: Any, style: Optional[str] = None
+    ) -> Optional[dict]:
         if self.stats.window_rollouts <= 0:
             return None
         self.counts[outcome] += 1
+        if style is not None:
+            self.styles[style] += 1
         self.rewards.append(reward)
         if reply_tokens is not None:
             self.tokens.append(reply_tokens)
@@ -349,6 +357,10 @@ class RateWindows:
                 round(sum(1 for g in multi if max(g) - min(g) < 1e-9) / len(multi), 4) if multi else None
             ),
             "mean_group_reward_std": (round(sum(_std(g) for g in multi) / len(multi), 4) if multi else None),
+            "abstain_styles": {k: self.styles[k] for k in ABSTAIN_STYLES},
+            "deflection_share_of_abstain": (
+                round(self.styles["deflection"] / self.counts["abstain"], 4) if self.counts["abstain"] else None
+            ),
             "grader_version": GRADER_VERSION,
         }
         abst = rec["abstain_rate"]
@@ -486,6 +498,7 @@ class FactualityServer(SimpleResourcesServer):
         outside = result.get("outside_answer")
         reward = reward_for(self.config.reward, outcome, reply_tokens, outside)
         failed = outcome == "judge_failed"
+        style = abstain_style(reply) if outcome == "abstain" else None
         task_index = (body.model_extra or {}).get(TASK_INDEX_KEY)
 
         response = FactualityVerifyResponse(
@@ -516,10 +529,13 @@ class FactualityServer(SimpleResourcesServer):
             is_wrong=float(outcome in ("hedged_wrong", "confident_wrong")),
             is_truncated=float(outcome == "truncated"),
             judge_failed=float(failed),
+            abstain_style=style,
+            is_abstain_deflection=float(style == "deflection"),
+            is_abstain_idk=float(style == "idk"),
             instance_config={"mask_sample": True} if failed else None,
         )
         if body.split != "validation":
-            self._windows.add(outcome, reward, reply_tokens, task_index)
+            self._windows.add(outcome, reward, reply_tokens, task_index, style)
         return response
 
 

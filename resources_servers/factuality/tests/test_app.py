@@ -423,6 +423,41 @@ async def test_validation_rows_stay_out_of_windows_and_guard(tmp_path) -> None:
     assert json.loads((tmp_path / "s.jsonl").read_text())["window"] == 0 and server._windows.tripped
 
 
+def test_abstain_style_classes() -> None:
+    from resources_servers.factuality.reply import abstain_style
+
+    deflections = [
+        "I'm sorry, but your question isn't clear. Could you provide more context?",
+        "I'm sorry, but you've provided a very broad question. Could you please provide more details?",
+        "I need more specific information to answer that; can you clarify which country you mean?",
+    ]
+    assert {abstain_style(r) for r in deflections} == {"deflection"}
+    assert abstain_style("The given document does not explicitly mention who the president was.") == "not_in_document"
+    assert abstain_style("The passage doesn't say when it opened.") == "not_in_document"
+    for r in ("I don't know.", "I'm not sure. It could be Ibsen or Strindberg.", "I don't have enough information."):
+        assert abstain_style(r) == "idk", r
+    assert abstain_style("   ") == "empty"
+    assert abstain_style("Pass.") == "other"
+    assert abstain_style("I'm not sure, could you clarify the year?") == "deflection"  # asking back wins
+
+
+async def test_abstention_style_reaches_response_and_window(tmp_path) -> None:
+    cases = {c["case"]: c for c in CASES}
+    cfg = _config(stats=StatsConfig(window_rollouts=3, path=str(tmp_path / "s.jsonl")))
+    outs = cases["idk"]["judge"] + cases["idk"]["judge"] + cases["plain_correct"]["judge"]
+    server, _, _ = _server(cfg, outs)
+    idk = await server.verify(_request(cases["idk"]))
+    deflect_case = {**cases["idk"], "reply": "Your question is unclear; could you provide more context?"}
+    defl = await server.verify(_request(deflect_case))
+    ok = await server.verify(_request(cases["plain_correct"]))
+    assert (idk.abstain_style, idk.is_abstain_idk, idk.is_abstain_deflection) == ("idk", 1.0, 0.0)
+    assert (defl.abstain_style, defl.is_abstain_deflection) == ("deflection", 1.0)
+    assert ok.abstain_style is None and ok.is_abstain_deflection == 0.0
+    rec = json.loads((tmp_path / "s.jsonl").read_text())
+    assert rec["abstain_styles"]["idk"] == 1 and rec["abstain_styles"]["deflection"] == 1
+    assert rec["deflection_share_of_abstain"] == 0.5
+
+
 def test_strip_thinking_variants() -> None:
     from resources_servers.factuality.reply import strip_thinking
 
