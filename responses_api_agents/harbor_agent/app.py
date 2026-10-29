@@ -165,10 +165,14 @@ async def run_harbor_job(job_config_dict: dict) -> str:
     from harbor.models.job.config import JobConfig
 
     config = JobConfig(**job_config_dict)
-    job = Job(config)
 
     job_error = None
     try:
+        # harbor >=0.20 moved task/metric resolution out of the constructor
+        # into this async factory; direct instantiation now raises. Both calls
+        # sit inside the try so a resolution failure still gets the
+        # trial-directory recovery below, as it did when run() resolved.
+        job = await Job.create(config)
         await job.run()
     except Exception as e:
         job_error = e

@@ -16,17 +16,40 @@ import json
 from pathlib import Path
 from typing import Any, Literal
 
-from harbor.agents.terminus_2.terminus_2 import Terminus2
+from harbor.agents.terminus_2.terminus_2 import Terminus2, Terminus2Options
 from harbor.environments.base import BaseEnvironment
 from harbor.llms.base import BaseLLM
 from harbor.models.agent.context import AgentContext
+from pydantic import Field
 
 from responses_api_agents.harbor_agent.custom_agents.llms.nemo_gym_llm import NemoGymLLM
 from responses_api_agents.harbor_agent.custom_envs.singularity.singularity import MemoryLimitExceededError
 
 
+class Terminus2NemoGymOptions(Terminus2Options):
+    """Terminus2's options plus the two this subclass adds.
+
+    harbor >=0.20 validates agent kwargs against ``options_model`` rather than
+    the constructor signature, and AgentOptions sets ``extra="forbid"``, so a
+    kwarg that only exists in ``__init__`` is rejected before the agent is ever
+    built. Declaring them here is what keeps them accepted.
+    """
+
+    responses_create_params: dict[str, Any] | None = Field(
+        default=None,
+        description="Extra params merged into each NeMo Gym responses request.",
+    )
+    nemo_model_server_timeout_sec: float = Field(
+        default=120.0,
+        description="Per-request timeout for the NeMo Gym model server.",
+    )
+
+
 class Terminus2NemoGym(Terminus2):
     """Terminus2 variant that uses a NeMo Gym model server-compatible BaseLLM."""
+
+    options_model = Terminus2NemoGymOptions
+    options: Terminus2NemoGymOptions
 
     @staticmethod
     def name() -> str:

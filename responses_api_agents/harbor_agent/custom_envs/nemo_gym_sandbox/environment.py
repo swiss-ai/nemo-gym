@@ -292,6 +292,7 @@ class NemoGymSandboxEnvironment(BaseEnvironment):
         cwd: str | None = None,
         env: dict[str, str] | None = None,
         timeout_sec: int | None = None,
+        user: str | int | None = None,
     ) -> ExecResult:
         timeout_s = timeout_sec if timeout_sec is not None else self._default_exec_timeout_s
         # Harbor's docker/daytona backends use an interactive bash, so
@@ -307,6 +308,11 @@ class NemoGymSandboxEnvironment(BaseEnvironment):
             cwd=cwd,
             env=env,
             timeout_s=timeout_s,
+            # harbor >=0.20 threads a per-command user through exec (it calls
+            # exec(..., user="root") to escalate for tmux install, collect
+            # hooks and verification). _resolve_user applies the environment's
+            # default_user when the caller passes None.
+            user=self._resolve_user(user),
         )
         return ExecResult(
             stdout=result.stdout,

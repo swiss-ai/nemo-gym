@@ -449,3 +449,92 @@ class TestFileTransfer:
         target = tmp_path / "verifier-out"
         await env.download_dir("/logs/verifier", target)
         assert (target / "reward.txt").read_bytes() == b"1.0"
+
+
+class TestExecUser:
+    """harbor >=0.20 threads a per-command ``user`` through BaseEnvironment.exec.
+
+    Harbor escalates with ``exec(..., user="root")`` to install tmux, run collect
+    hooks and run the verifier. An override that omits the parameter raises
+    TypeError and fails every trial during agent setup.
+    """
+
+    @pytest.mark.asyncio
+    async def test_exec_accepts_and_forwards_user(self, tmp_path):
+        env = _make_environment(tmp_path, exec_shell=None)
+        await env.start(force_build=False)
+
+        await env.exec("tmux -V", user="root")
+
+        assert _provider().exec_calls[-1]["user"] == "root"
+
+    @pytest.mark.asyncio
+    async def test_exec_defaults_user_to_none(self, tmp_path):
+        """None must stay None so the sandbox client can reuse its default session."""
+        env = _make_environment(tmp_path, exec_shell=None)
+        await env.start(force_build=False)
+
+        await env.exec("true")
+
+        assert _provider().exec_calls[-1]["user"] is None
+
+    @pytest.mark.asyncio
+    async def test_exec_applies_environment_default_user(self, tmp_path):
+        """Harbor sets default_user so agents need not thread it through each call."""
+        env = _make_environment(tmp_path, exec_shell=None)
+        await env.start(force_build=False)
+        env.default_user = "agent"
+
+        await env.exec("true")
+
+        assert _provider().exec_calls[-1]["user"] == "agent"
+
+    @pytest.mark.asyncio
+    async def test_explicit_user_overrides_default_user(self, tmp_path):
+        env = _make_environment(tmp_path, exec_shell=None)
+        await env.start(force_build=False)
+        env.default_user = "agent"
+
+        await env.exec("true", user="root")
+
+        assert _provider().exec_calls[-1]["user"] == "root"
+
+
+class TestBaseEnvironmentSignatureDrift:
+    """Guard against harbor widening a BaseEnvironment method we override.
+
+    Every harbor bump so far has broken this integration by adding a parameter
+    to a method we override (``exec`` gained ``user`` in 0.20). Such breaks are
+    invisible until a rollout crashes mid-run, so compare signatures directly.
+    """
+
+    def test_no_override_drops_a_base_parameter(self):
+        import inspect
+
+        from harbor.environments.base import BaseEnvironment
+
+        drifted: dict[str, list[str]] = {}
+        for name in dir(BaseEnvironment):
+            if name.startswith("__"):
+                continue
+            base_attr = getattr(BaseEnvironment, name, None)
+            our_attr = getattr(NemoGymSandboxEnvironment, name, None)
+            # Only methods we actually override can drift.
+            if not callable(base_attr) or our_attr is base_attr:
+                continue
+            try:
+                base_params = inspect.signature(base_attr).parameters
+                our_params = inspect.signature(our_attr).parameters
+            except (TypeError, ValueError):
+                continue
+            if any(p.kind is p.VAR_KEYWORD for p in our_params.values()):
+                continue
+            missing = [p for p in base_params if p not in our_params and p != "self"]
+            if missing:
+                drifted[name] = missing
+
+        assert not drifted, (
+            "Overrides are missing parameters that harbor's BaseEnvironment now passes: "
+            f"{drifted}. Add them (forwarding to the sandbox client) or harbor will "
+            "raise TypeError at rollout time."
+        )
