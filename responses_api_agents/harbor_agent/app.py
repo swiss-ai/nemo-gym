@@ -465,12 +465,9 @@ class HarborAgent(SimpleResponsesAPIAgent):
     ) -> dict:
         """Build a Harbor JobConfig dict for a single task."""
         from harbor.models.job.config import (
+            DatasetConfig,
             JobConfig,
-            LocalDatasetConfig,
-            OrchestratorConfig,
-            RegistryDatasetConfig,
         )
-        from harbor.models.registry import RemoteRegistryInfo
         from harbor.models.trial.config import (
             AgentConfig,
             EnvironmentConfig,
@@ -545,20 +542,18 @@ class HarborAgent(SimpleResponsesAPIAgent):
             ),
         )
 
-        orchestrator_config = OrchestratorConfig(
-            n_concurrent_trials=1,
-            quiet=True,
-        )
-
+        # harbor >=0.20 merged Local/RegistryDatasetConfig into a single
+        # DatasetConfig and flattened OrchestratorConfig onto JobConfig.
+        # Leaving registry_url unset selects the default harbor registry,
+        # which is what RemoteRegistryInfo() used to supply.
         if has_registry:
-            dataset_config = RegistryDatasetConfig(
-                registry=RemoteRegistryInfo(),
+            dataset_config = DatasetConfig(
                 name=dataset_source.dataset_name,
                 version=dataset_source.dataset_version,
                 task_names=[task_name],
             )
         else:
-            dataset_config = LocalDatasetConfig(
+            dataset_config = DatasetConfig(
                 path=Path(dataset_source.local_dataset_path),
                 task_names=[task_name],
             )
@@ -569,7 +564,8 @@ class HarborAgent(SimpleResponsesAPIAgent):
             timeout_multiplier=(
                 self.config.harbor_timeout_multiplier if self.config.harbor_timeout_multiplier is not None else 1.0
             ),
-            orchestrator=orchestrator_config,
+            n_concurrent_trials=1,
+            quiet=True,
             environment=environment_config,
             verifier=verifier_config,
             agents=[agent_config],

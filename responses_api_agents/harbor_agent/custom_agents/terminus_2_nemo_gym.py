@@ -74,6 +74,11 @@ class Terminus2NemoGym(Terminus2):
                 timeout_sec=nemo_model_server_timeout_sec,
             )
 
+        # Harbor >=0.20 dropped the `llm` constructor parameter: Terminus2 now
+        # builds its own backend by calling self._init_llm() from __init__.
+        # Stash the instance first so the override below can hand it back.
+        self._injected_llm = llm
+
         super().__init__(
             logs_dir=logs_dir,
             model_name=model_name,
@@ -93,11 +98,20 @@ class Terminus2NemoGym(Terminus2):
             tmux_pane_height=tmux_pane_height,
             store_all_messages=store_all_messages,
             record_terminal_session=record_terminal_session,
-            llm=llm,
             interleaved_thinking=interleaved_thinking,
             *args,
             **kwargs,
         )
+
+    def _init_llm(self, *args: Any, **kwargs: Any) -> BaseLLM:
+        """Return the NeMo Gym LLM instead of Terminus2's litellm/tinker backends.
+
+        Terminus2._init_llm is a closed `match` over LLMBackend with no
+        extension point, so overriding it is the only way to inject a custom
+        BaseLLM. Signature is deliberately permissive: upstream passes every
+        argument by keyword and has changed the set across releases.
+        """
+        return self._injected_llm
 
     async def run(self, instruction: str, environment: BaseEnvironment, context: AgentContext) -> None:
         """Override run() to gracefully handle agent errors.
