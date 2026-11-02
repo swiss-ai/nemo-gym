@@ -116,6 +116,12 @@ class HarborAgentConfig(BaseResponsesAPIAgentConfig):
     # --- Model routing ---
     # NeMo Gym model server reference used to resolve Harbor model base URL.
     model_server: ModelServerRef
+    # Root URL (without "/v1") under which the Harbor agent reaches that model server. Defaults to
+    # http://<host>:<port> of `model_server`. Set it when the agent's model calls originate somewhere
+    # that cannot reach that address, e.g. an installed agent running inside a remote sandbox that
+    # reaches the model server only through a proxy. The rollout's capture prefix
+    # (/ng-rollout/<id>[/training-token-capture]) is appended to it either way.
+    harbor_model_base_url: Optional[str] = None
 
 
 class HarborRunRequest(BaseRunRequest):
@@ -276,7 +282,7 @@ class HarborAgent(SimpleResponsesAPIAgent):
             global_config_dict = get_global_config_dict()
 
             policy_model_name = global_config_dict["policy_model_name"]
-            base_url = self._resolve_model_base_url(global_config_dict)
+            base_url = self._resolve_model_base_url(global_config_dict, body)
             run_timestamp = datetime.now(timezone.utc)
             run_id = self._build_run_id(run_timestamp)
 
@@ -448,14 +454,23 @@ class HarborAgent(SimpleResponsesAPIAgent):
         sanitized = sanitized.strip("._")
         return sanitized or "unknown"
 
-    def _resolve_model_base_url(self, global_config_dict: Any) -> str:
-        """Resolve model base URL from required model_server reference."""
-        server_name = self.config.model_server.name
-        model_server_config = get_first_server_config_dict(
-            global_config_dict,
-            server_name,
-        )
-        return f"http://{model_server_config['host']}:{model_server_config['port']}/v1"
+    def _resolve_model_base_url(self, global_config_dict: Any, body: Optional[HarborRunRequest] = None) -> str:
+        """Resolve the model base URL handed to the Harbor agent.
+
+        The root is `harbor_model_base_url` or the model_server's host:port. When model-call or
+        training-token capture is enabled, the run's rollout prefix is inserted before "/v1" so
+        the model server can attribute every call of this rollout (see base_url_for_run).
+        """
+        if self.config.harbor_model_base_url:
+            root = self.config.harbor_model_base_url.rstrip("/").removesuffix("/v1")
+        else:
+            server_name = self.config.model_server.name
+            model_server_config = get_first_server_config_dict(
+                global_config_dict,
+                server_name,
+            )
+            root = f"http://{model_server_config['host']}:{model_server_config['port']}"
+        return f"{self.base_url_for_run(root, body)}/v1"
 
     def _build_job_config(
         self,

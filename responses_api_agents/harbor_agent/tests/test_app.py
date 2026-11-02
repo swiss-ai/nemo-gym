@@ -470,6 +470,49 @@ class TestApp:
         assert server._get_jobs_output_dir("deepseek-ai/DeepSeek-V3.2", "scientific", ts).parts[-3] == "20260210"
         assert server._get_results_output_dir("my-plain-model", "scientific", ts).parts[-1] == "my-plain-model"
 
+    def test_model_base_url_without_capture_is_plain(self) -> None:
+        server = _make_server()
+        server.server_client.global_config_dict = {}
+        body = HarborRunRequest.model_validate(
+            {"instance_id": "scientific::t", "responses_create_params": {"input": []}, "_ng_rollout_id": "3-1"}
+        )
+        assert server._resolve_model_base_url(_GLOBAL_CONFIG, body) == "http://policy-host:9000/v1"
+        assert server._resolve_model_base_url(_GLOBAL_CONFIG) == "http://policy-host:9000/v1"
+
+    def test_model_base_url_with_training_capture_carries_rollout_prefix(self) -> None:
+        server = _make_server(token_id_capture=True)
+        server.server_client.global_config_dict = {"token_id_capture": {"enabled": True}}
+        body = HarborRunRequest.model_validate(
+            {"instance_id": "scientific::t", "responses_create_params": {"input": []}, "_ng_rollout_id": "3-1"}
+        )
+        assert (
+            server._resolve_model_base_url(_GLOBAL_CONFIG, body)
+            == "http://policy-host:9000/ng-rollout/3-1/training-token-capture/v1"
+        )
+
+    def test_model_base_url_capture_needs_agent_opt_in(self) -> None:
+        server = _make_server()
+        server.server_client.global_config_dict = {"token_id_capture": {"enabled": True}}
+        body = HarborRunRequest.model_validate(
+            {"instance_id": "scientific::t", "responses_create_params": {"input": []}, "_ng_rollout_id": "3-1"}
+        )
+        assert server._resolve_model_base_url(_GLOBAL_CONFIG, body) == "http://policy-host:9000/v1"
+
+    @pytest.mark.parametrize(
+        "override",
+        ["https://proxy.example.org/gym", "https://proxy.example.org/gym/", "https://proxy.example.org/gym/v1"],
+    )
+    def test_model_base_url_override_keeps_capture_prefix(self, override: str) -> None:
+        server = _make_server(token_id_capture=True, harbor_model_base_url=override)
+        server.server_client.global_config_dict = {"token_id_capture": {"enabled": True}}
+        body = HarborRunRequest.model_validate(
+            {"instance_id": "scientific::t", "responses_create_params": {"input": []}, "_ng_rollout_id": "3-1"}
+        )
+        assert (
+            server._resolve_model_base_url(_GLOBAL_CONFIG, body)
+            == "https://proxy.example.org/gym/ng-rollout/3-1/training-token-capture/v1"
+        )
+
     def test_build_job_config_uses_daytona_type_when_import_path_is_clear(self) -> None:
         pytest.importorskip("harbor")
         server = _make_server(
