@@ -501,6 +501,24 @@ class TestApp:
             == "http://policy-host:9000/ng-rollout/3-1/training-token-capture/v1"
         )
 
+    def test_mask_without_capture_follows_output_items(self) -> None:
+        server = _make_server()
+        server.server_client.global_config_dict = {}
+        verified = {"verifier_result": {"rewards": {"reward": 1.0}}}
+        assert server._should_mask(verified, []) is True
+        assert server._should_mask(verified, [{"type": "message"}]) is False
+
+    def test_mask_with_capture_ignores_empty_output_but_not_failed_trials(self) -> None:
+        server = _make_server(token_id_capture=True)
+        server.server_client.global_config_dict = {"token_id_capture": {"enabled": True}}
+        verified = {"verifier_result": {"rewards": {"reward": 0.0}}}
+        # OpenCode writes no ATIF: empty output, tokens come from the capture ledger
+        assert server._should_mask(verified, []) is False
+        # run() fell into its except branch
+        assert server._should_mask(None, []) is True
+        # trial ended without a verifier result (setup or agent crash)
+        assert server._should_mask({"verifier_result": None}, [{"type": "message"}]) is True
+
     def test_model_base_url_capture_needs_agent_opt_in(self) -> None:
         server = _make_server()
         server.server_client.global_config_dict = {"token_id_capture": {"enabled": True}}

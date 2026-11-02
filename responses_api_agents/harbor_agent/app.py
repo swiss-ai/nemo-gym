@@ -390,7 +390,7 @@ class HarborAgent(SimpleResponsesAPIAgent):
                 # the trainer can drop it from the gradient instead; NeMo-RL
                 # reads this exact path (instance_config.mask_sample), which is
                 # also how anyswe_agent reports sandbox failures.
-                instance_config={"mask_sample": not output_items},
+                instance_config={"mask_sample": self._should_mask(trial_result, output_items)},
                 context_length_exceeded_error=int(agent_error_flags.get("context_length_exceeded", False)),
                 memory_limit_exceeded_error=int(agent_error_flags.get("memory_limit_exceeded", False)),
                 agent_timeout_error=int(
@@ -457,6 +457,19 @@ class HarborAgent(SimpleResponsesAPIAgent):
         sanitized = re.sub(r"\s+", "_", sanitized)
         sanitized = sanitized.strip("._")
         return sanitized or "unknown"
+
+    def _should_mask(self, trial_result: Optional[dict], output_items: list) -> bool:
+        """Whether the trainer should drop this rollout from the gradient.
+
+        Without training-token capture the tokens come from the output items, so a rollout without
+        any is untrainable. With capture the model server holds the tokens and rebuilds the rollout
+        (and masks it itself when no call chain was captured); agents such as OpenCode write no ATIF
+        trajectory at all, so empty output is expected there. The rollout is still masked when the
+        trial failed or the verifier never produced a result, since its reward then means nothing.
+        """
+        if not self._token_id_capture_enabled():
+            return not output_items
+        return trial_result is None or not trial_result.get("verifier_result")
 
     def _resolve_model_base_url(self, global_config_dict: Any, body: Optional[HarborRunRequest] = None) -> str:
         """Resolve the model base URL handed to the Harbor agent.
