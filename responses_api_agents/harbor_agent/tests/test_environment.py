@@ -18,6 +18,7 @@ from typing import Optional
 
 import pytest
 from harbor.models.task.config import EnvironmentConfig as TaskEnvironmentConfig
+from harbor.models.task.config import NetworkMode, NetworkPolicy
 from harbor.models.trial.paths import TrialPaths
 
 from nemo_gym.sandbox import SandboxExecResult, SandboxHandle, SandboxSpec, SandboxStatus, register_provider
@@ -129,14 +130,21 @@ class TestValidation:
             _make_environment(tmp_path, task_env_config=TaskEnvironmentConfig(docker_image=None))
 
     def test_rejects_internet_isolation_by_default(self, tmp_path):
-        config = TaskEnvironmentConfig(docker_image="example/task:1.0", allow_internet=False)
-        with pytest.raises(ValueError, match="allow_internet"):
-            _make_environment(tmp_path, task_env_config=config)
+        # Harbor >=0.20 migrates a task's allow_internet=false into
+        # network_mode="no-network" at TaskConfig load time, and the base class
+        # rejects it unless the environment advertises the disable_internet
+        # capability. Asserting on the policy keeps this pinned to the real guard.
+        with pytest.raises(ValueError, match="no-network"):
+            _make_environment(tmp_path, network_policy=NetworkPolicy(network_mode=NetworkMode.NO_NETWORK))
 
     def test_internet_isolation_opt_in(self, tmp_path):
-        config = TaskEnvironmentConfig(docker_image="example/task:1.0", allow_internet=False)
-        env = _make_environment(tmp_path, task_env_config=config, allow_unenforced_internet_isolation=True)
+        env = _make_environment(
+            tmp_path,
+            network_policy=NetworkPolicy(network_mode=NetworkMode.NO_NETWORK),
+            allow_unenforced_internet_isolation=True,
+        )
         assert env.can_disable_internet is True
+        assert env.capabilities.disable_internet is True
 
 
 class TestStartStop:
@@ -306,9 +314,12 @@ class TestExec:
         assert _provider().exec_calls[-1]["command"] == "true"
 
     @pytest.mark.asyncio
-    async def test_exec_cpu_pin_width_tracks_task_cpu_default(self, tmp_path):
-        # Harbor defaults EnvironmentConfig.cpus to 1, so a task without an
-        # explicit cpu count pins with width 1 (matching its cgroup limit).
+    async def test_exec_cpu_pin_skipped_without_task_cpu_count(self, tmp_path):
+        # Harbor >=0.20 defaults EnvironmentConfig.cpus to None (it used to be 1),
+        # so a task that omits a cpu count gives no width to pin to and runs
+        # unpinned rather than pinning to a bogus width. Note the same None also
+        # means _build_spec sends no cpu limit, so such tasks get the cluster
+        # default; task.toml should set cpus explicitly.
         env = _make_environment(
             tmp_path,
             exec_shell=None,
@@ -317,9 +328,7 @@ class TestExec:
         )
         await env.start(force_build=False)
         await env.exec("true")
-        command = _provider().exec_calls[-1]["command"]
-        assert command.startswith("__osb_w=1; ")
-        assert command.endswith("$__osb_pin true")
+        assert _provider().exec_calls[-1]["command"] == "true"
 
     def test_cpu_pin_prefix_is_valid_posix_sh(self):
         import shutil
@@ -440,3 +449,92 @@ class TestFileTransfer:
         target = tmp_path / "verifier-out"
         await env.download_dir("/logs/verifier", target)
         assert (target / "reward.txt").read_bytes() == b"1.0"
+
+
+class TestExecUser:
+    """harbor >=0.20 threads a per-command ``user`` through BaseEnvironment.exec.
+
+    Harbor escalates with ``exec(..., user="root")`` to install tmux, run collect
+    hooks and run the verifier. An override that omits the parameter raises
+    TypeError and fails every trial during agent setup.
+    """
+
+    @pytest.mark.asyncio
+    async def test_exec_accepts_and_forwards_user(self, tmp_path):
+        env = _make_environment(tmp_path, exec_shell=None)
+        await env.start(force_build=False)
+
+        await env.exec("tmux -V", user="root")
+
+        assert _provider().exec_calls[-1]["user"] == "root"
+
+    @pytest.mark.asyncio
+    async def test_exec_defaults_user_to_none(self, tmp_path):
+        """None must stay None so the sandbox client can reuse its default session."""
+        env = _make_environment(tmp_path, exec_shell=None)
+        await env.start(force_build=False)
+
+        await env.exec("true")
+
+        assert _provider().exec_calls[-1]["user"] is None
+
+    @pytest.mark.asyncio
+    async def test_exec_applies_environment_default_user(self, tmp_path):
+        """Harbor sets default_user so agents need not thread it through each call."""
+        env = _make_environment(tmp_path, exec_shell=None)
+        await env.start(force_build=False)
+        env.default_user = "agent"
+
+        await env.exec("true")
+
+        assert _provider().exec_calls[-1]["user"] == "agent"
+
+    @pytest.mark.asyncio
+    async def test_explicit_user_overrides_default_user(self, tmp_path):
+        env = _make_environment(tmp_path, exec_shell=None)
+        await env.start(force_build=False)
+        env.default_user = "agent"
+
+        await env.exec("true", user="root")
+
+        assert _provider().exec_calls[-1]["user"] == "root"
+
+
+class TestBaseEnvironmentSignatureDrift:
+    """Guard against harbor widening a BaseEnvironment method we override.
+
+    Every harbor bump so far has broken this integration by adding a parameter
+    to a method we override (``exec`` gained ``user`` in 0.20). Such breaks are
+    invisible until a rollout crashes mid-run, so compare signatures directly.
+    """
+
+    def test_no_override_drops_a_base_parameter(self):
+        import inspect
+
+        from harbor.environments.base import BaseEnvironment
+
+        drifted: dict[str, list[str]] = {}
+        for name in dir(BaseEnvironment):
+            if name.startswith("__"):
+                continue
+            base_attr = getattr(BaseEnvironment, name, None)
+            our_attr = getattr(NemoGymSandboxEnvironment, name, None)
+            # Only methods we actually override can drift.
+            if not callable(base_attr) or our_attr is base_attr:
+                continue
+            try:
+                base_params = inspect.signature(base_attr).parameters
+                our_params = inspect.signature(our_attr).parameters
+            except (TypeError, ValueError):
+                continue
+            if any(p.kind is p.VAR_KEYWORD for p in our_params.values()):
+                continue
+            missing = [p for p in base_params if p not in our_params and p != "self"]
+            if missing:
+                drifted[name] = missing
+
+        assert not drifted, (
+            "Overrides are missing parameters that harbor's BaseEnvironment now passes: "
+            f"{drifted}. Add them (forwarding to the sandbox client) or harbor will "
+            "raise TypeError at rollout time."
+        )

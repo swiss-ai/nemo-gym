@@ -863,3 +863,161 @@ class TestLLMClientTeardown:
         # Idempotent: a second close is a no-op (no underlying client to touch).
         await llm.aclose()
         client.aclose.assert_awaited_once()
+
+
+class _FakeJob:
+    """Stand-in for harbor.job.Job that keeps the real construction contract.
+
+    harbor >=0.20 resolves tasks and metrics in an async factory and makes the
+    constructor raise, so a stub that happily accepts ``Job(config)`` would
+    hide exactly the breakage this mirrors.
+    """
+
+    created_with: Optional[Any] = None
+    ran = False
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        raise ValueError("Instantiating Job directly is deprecated. Use `await Job.create(config)` instead.")
+
+    @classmethod
+    async def create(cls, config: Any) -> "_FakeJob":
+        job = cls.__new__(cls)
+        cls.created_with = config
+        return job
+
+    async def run(self) -> None:
+        type(self).ran = True
+
+
+class _FailingJob(_FakeJob):
+    @classmethod
+    async def create(cls, config: Any) -> "_FakeJob":
+        raise RuntimeError("no tasks resolved")
+
+
+def _write_trial_result(jobs_dir: Path, job_name: str) -> Path:
+    trial_dir = jobs_dir / job_name / "trial-0"
+    trial_dir.mkdir(parents=True)
+    (trial_dir / "result.json").write_text("{}")
+    return trial_dir
+
+
+class TestRunHarborJob:
+    """run_harbor_job must drive Harbor through its async factory."""
+
+    @staticmethod
+    def _config_dict(jobs_dir: Path) -> Dict[str, Any]:
+        from harbor.models.job.config import JobConfig
+
+        return JobConfig(job_name="job", jobs_dir=jobs_dir).model_dump(mode="json")
+
+    async def test_constructs_job_via_async_factory(self, tmp_path):
+        from responses_api_agents.harbor_agent.app import run_harbor_job
+
+        _FakeJob.created_with = None
+        _FakeJob.ran = False
+        trial_dir = _write_trial_result(tmp_path, "job")
+
+        with patch("harbor.job.Job", _FakeJob):
+            result = await run_harbor_job(self._config_dict(tmp_path))
+
+        # Direct instantiation would have raised out of run_harbor_job.
+        assert _FakeJob.created_with is not None
+        assert _FakeJob.ran is True
+        assert result == str(trial_dir.resolve())
+
+    async def test_returns_absolute_path(self, tmp_path):
+        from responses_api_agents.harbor_agent.app import run_harbor_job
+
+        _write_trial_result(tmp_path, "job")
+
+        with patch("harbor.job.Job", _FakeJob):
+            result = await run_harbor_job(self._config_dict(tmp_path))
+
+        assert Path(result).is_absolute()
+
+    async def test_recovers_trial_dir_when_create_fails(self, tmp_path):
+        """Resolution failures must still surrender a written trial directory."""
+        from responses_api_agents.harbor_agent.app import run_harbor_job
+
+        trial_dir = _write_trial_result(tmp_path, "job")
+
+        with patch("harbor.job.Job", _FailingJob):
+            result = await run_harbor_job(self._config_dict(tmp_path))
+
+        assert result == str(trial_dir.resolve())
+
+    async def test_reraises_when_no_trial_dir(self, tmp_path):
+        from responses_api_agents.harbor_agent.app import run_harbor_job
+
+        with patch("harbor.job.Job", _FailingJob):
+            with pytest.raises(RuntimeError, match="no tasks resolved"):
+                await run_harbor_job(self._config_dict(tmp_path))
+
+
+# ===========================================================================
+#  Agent options schema (harbor validates kwargs against options_model)
+# ===========================================================================
+
+
+class TestAgentOptionsSchema:
+    """harbor >=0.20 validates agent kwargs against ``options_model``, not the
+    constructor signature, and AgentOptions sets ``extra="forbid"``. Kwargs this
+    subclass adds must therefore be declared on its options model, or every
+    rollout dies in Job.create's agent preflight before a sandbox is created."""
+
+    def _parse(self, **overrides):
+        pytest.importorskip("harbor")
+        from responses_api_agents.harbor_agent.custom_agents.terminus_2_nemo_gym import Terminus2NemoGym
+
+        kwargs = {
+            "api_base": "http://127.0.0.1:8000/v1",
+            "responses_create_params": {"temperature": 1.0},
+            "temperature": 1.0,
+            "max_turns": 30,
+            "model_info": {"max_input_tokens": 32768},
+            "nemo_model_server_timeout_sec": 600.0,
+        }
+        kwargs.update(overrides)
+        return Terminus2NemoGym.parse_options(kwargs)
+
+    def test_accepts_nemo_gym_specific_kwargs(self) -> None:
+        options = self._parse()
+        assert options.responses_create_params == {"temperature": 1.0}
+        assert options.nemo_model_server_timeout_sec == 600.0
+
+    def test_nemo_gym_kwargs_have_defaults(self) -> None:
+        pytest.importorskip("harbor")
+        from responses_api_agents.harbor_agent.custom_agents.terminus_2_nemo_gym import Terminus2NemoGym
+
+        options = Terminus2NemoGym.parse_options({})
+        assert options.responses_create_params is None
+        assert options.nemo_model_server_timeout_sec == 120.0
+
+    def test_inherited_terminus2_kwargs_still_accepted(self) -> None:
+        options = self._parse(collect_rollout_details=True)
+        assert options.max_turns == 30
+        assert options.collect_rollout_details is True
+
+    def test_unknown_kwarg_is_still_rejected(self) -> None:
+        """The schema must stay strict: typos should fail loudly, not be ignored."""
+        with pytest.raises(ValueError, match="definitely_not_an_option"):
+            self._parse(definitely_not_an_option=1)
+
+    def test_preflight_accepts_our_agent_config(self) -> None:
+        """End-to-end over harbor's real preflight, the call that was failing."""
+        pytest.importorskip("harbor")
+        from harbor.agents.factory import AgentFactory
+        from harbor.models.trial.config import AgentConfig
+
+        config = AgentConfig(
+            import_path=("responses_api_agents.harbor_agent.custom_agents.terminus_2_nemo_gym:Terminus2NemoGym"),
+            model_name="Qwen/Qwen2.5-1.5B-Instruct",
+            kwargs={
+                "api_base": "http://127.0.0.1:8000/v1",
+                "responses_create_params": {"temperature": 1.0},
+                "max_turns": 30,
+                "nemo_model_server_timeout_sec": 600.0,
+            },
+        )
+        AgentFactory.run_preflight(config, skip_credential_checks=True)
