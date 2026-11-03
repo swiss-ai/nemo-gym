@@ -85,6 +85,36 @@ class ModelTunnelConfig:
         return Path(self.chisel_dir) / f"chisel_{self.chisel_version}_linux_{arch}"
 
 
+def server_start_script(cfg: ModelTunnelConfig, wait_s: float = 15.0) -> str:
+    """sh: start the chisel server detached and return only once it listens (or fail with its log).
+
+    The command must not return before the server has left the exec's process group: the sandbox's
+    exec service may signal that group when the command ends, and a fire-and-forget ``(setsid ... &)``
+    races with that. Waiting for chisel's "Listening on" line also turns a server that dies at start
+    (bad binary, port taken) into an error here instead of a client timeout later.
+    """
+    b = shlex.quote(cfg.pod_binary)
+    log = shlex.quote(cfg.pod_binary + ".log")
+    tries = max(1, int(wait_s / 0.2))
+    return (
+        f"chmod +x {b} || exit 1; (setsid nohup {b} server --host 0.0.0.0 --port {cfg.server_port} --reverse "
+        f"> {log} 2>&1 &); "
+        f"i=0; while [ $i -lt {tries} ]; do "
+        f"grep -q 'Listening on' {log} 2>/dev/null && exit 0; i=$((i+1)); sleep 0.2; done; "
+        f"echo 'chisel server not listening after {wait_s:g}s:'; cat {log}; exit 1"
+    )
+
+
+def pod_diagnostics_script(cfg: ModelTunnelConfig) -> str:
+    """sh: the server log tail and how many chisel server processes run (no ps in slim images)."""
+    log = shlex.quote(cfg.pod_binary + ".log")
+    return (
+        f"tail -n 20 {log}; n=0; for c in /proc/[0-9]*/cmdline; do "
+        "tr '\\0' ' ' < \"$c\" 2>/dev/null | grep -q '[c]hisel server' && n=$((n+1)); done; "
+        'echo "chisel server processes: $n"'
+    )
+
+
 def health_check_script(pod_port: int, path: str, attempts: int = 40) -> str:
     """bash: GET ``path`` on 127.0.0.1:``pod_port`` (retried while the reverse listener comes up),
     print the status line, exit 0 on any answer."""
@@ -157,14 +187,12 @@ class ModelTunnel:
         # One credential per sandbox: the endpoint is reachable by every holder of the provider API key.
         # Passed as AUTH (chisel reads it from the environment), so it stays out of argv on both sides.
         auth = f"nemo-gym:{secrets.token_hex(16)}"
-        b = shlex.quote(cfg.pod_binary)
-        start = (
-            f"chmod +x {b} && (setsid nohup {b} server --host 0.0.0.0 --port {cfg.server_port} --reverse "
-            f"> {b}.log 2>&1 &)"
-        )
-        res = await self._exec(start, env={"AUTH": auth}, timeout_s=60)
+        res = await self._exec(server_start_script(cfg), env={"AUTH": auth}, timeout_s=60)
         if res.return_code != 0:
-            raise RuntimeError(f"model_tunnel: chisel server start failed: {res.stdout!r} {res.stderr!r}")
+            raise RuntimeError(
+                f"model_tunnel{self._label}: chisel server in the sandbox did not come up: "
+                f"rc={res.return_code} {res.stdout!r} {res.stderr!r}"
+            )
 
         endpoint = await self._sandbox.endpoint(cfg.server_port)
         args = [str(node_bin), "client", "--max-retry-count", str(cfg.max_retry_count), "--max-retry-interval", "10s"]
@@ -194,7 +222,7 @@ class ModelTunnel:
         if not self._connected.is_set():
             raise RuntimeError(
                 f"model_tunnel{self._label}: chisel client did not connect within {cfg.connect_timeout_s}s; "
-                f"client output: {self.client_log_tail[-10:]}"
+                f"client output: {self.client_log_tail[-10:]}; sandbox side: {await self._pod_log()!r}"
             )
         self._logger.debug(
             "model_tunnel%s: connected, sandbox 127.0.0.1:%s -> %s", self._label, cfg.pod_port, cfg.target
@@ -212,6 +240,14 @@ class ModelTunnel:
                 )
             return f"GET {cfg.health_path}: {status_line}"
         return "no health check"
+
+    async def _pod_log(self) -> str:
+        """Best effort: the sandbox-side chisel log and whether it still runs, for error messages."""
+        try:
+            res = await self._exec(pod_diagnostics_script(self._config), timeout_s=20)
+            return (res.stdout or "").strip()
+        except Exception as exc:  # noqa: BLE001 - diagnostics only
+            return f"<unavailable: {exc!r}>"
 
     async def _read_client_output(self) -> None:
         assert self._proc is not None and self._proc.stdout is not None

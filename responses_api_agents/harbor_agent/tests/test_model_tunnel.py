@@ -16,8 +16,11 @@ import json
 import logging
 import os
 import platform
+import re
 import shutil
+import signal
 import subprocess
+import time
 import threading
 from pathlib import Path
 from typing import Optional
@@ -31,6 +34,8 @@ from responses_api_agents.harbor_agent.custom_envs.nemo_gym_sandbox.model_tunnel
     ModelTunnel,
     ModelTunnelConfig,
     health_check_script,
+    pod_diagnostics_script,
+    server_start_script,
 )
 
 
@@ -199,6 +204,41 @@ class TestOpenClose:
             await ModelTunnel(FakeSandbox(pod_arch="s390x"), _config(chisel_dir), logging.getLogger("t")).open()
 
 
+class TestServerStartFailure:
+    @pytest.mark.asyncio
+    async def test_failed_server_start_fails_open_before_the_client(self, chisel_dir, tmp_path):
+        record = tmp_path / "c.json"
+        _fake_chisel(chisel_dir / f"chisel_1.12.0_linux_{NODE_ARCH}", record)
+
+        class DeadServer(FakeSandbox):
+            async def exec(self, command, *, env=None, timeout_s=None):
+                if "server" in command and "--reverse" in command:
+                    self.exec_calls.append({"command": command, "env": env})
+                    out = "chisel server not listening after 15s:\nboom"
+                    return SandboxExecResult(stdout=out, stderr=None, return_code=1)
+                return await super().exec(command, env=env, timeout_s=timeout_s)
+
+        tunnel = ModelTunnel(DeadServer(), _config(chisel_dir), logging.getLogger("t"))
+        with pytest.raises(RuntimeError, match="did not come up") as exc:
+            await tunnel.open()
+        assert "boom" in str(exc.value)
+        assert not record.exists()  # the node-side client was never started
+
+    @pytest.mark.asyncio
+    async def test_client_timeout_reports_the_sandbox_side(self, chisel_dir, tmp_path):
+        _fake_chisel(chisel_dir / f"chisel_1.12.0_linux_{NODE_ARCH}", tmp_path / "c.json", connect=False)
+
+        class WithLog(FakeSandbox):
+            async def exec(self, command, *, env=None, timeout_s=None):
+                if command.startswith("tail -n 20"):
+                    out = "server: Listening\nchisel server processes: 0"
+                    return SandboxExecResult(stdout=out, stderr=None, return_code=0)
+                return await super().exec(command, env=env, timeout_s=timeout_s)
+
+        with pytest.raises(RuntimeError, match="chisel server processes: 0"):
+            await ModelTunnel(WithLog(), _config(chisel_dir), logging.getLogger("t")).open()
+
+
 class _Health(http.server.BaseHTTPRequestHandler):
     def do_GET(self):  # noqa: N802
         self.send_response(200 if self.path == "/health" else 404)
@@ -237,3 +277,62 @@ class TestHealthCheckScript:
             timeout=30,
         )
         assert res.returncode == 1 and "no answer" in res.stdout
+
+
+def _fake_server(path: Path, body: str) -> ModelTunnelConfig:
+    path.write_text("#!/bin/bash\n" + body)
+    return ModelTunnelConfig(chisel_dir=str(path.parent), pod_binary=str(path))
+
+
+def _running(pod_binary: Path) -> list[int]:
+    pids = []
+    for cmdline in Path("/proc").glob("[0-9]*/cmdline"):
+        try:
+            if f"{pod_binary} server".encode() in cmdline.read_bytes().replace(b"\0", b" "):
+                pids.append(int(cmdline.parent.name))
+        except OSError:
+            pass
+    return pids
+
+
+class TestPodScripts:
+    """The sandbox-side shell scripts run for real (sh, as the sandbox exec service runs them)."""
+
+    def test_server_start_returns_once_listening_and_survives_a_group_kill(self, tmp_path):
+        # chisel prints "Listening on" after a moment; the exec service may SIGKILL the command's
+        # process group as soon as the command returns (job 5245999: no server behind the proxy).
+        binary = tmp_path / ".nemo-gym-chisel"  # its cmdline must keep "<binary> server": no exec
+        cfg = _fake_server(binary, 'sleep 0.5; echo "server: Listening on http://0.0.0.0:$5"; sleep 30\n')
+        proc = subprocess.Popen(
+            ["sh", "-c", server_start_script(cfg)], start_new_session=True, stdout=subprocess.PIPE, text=True
+        )
+        try:
+            out, _ = proc.communicate(timeout=20)
+            assert proc.returncode == 0, out
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            time.sleep(0.3)
+            assert _running(binary), "server died with the exec's process group"
+            diag = subprocess.run(["sh", "-c", pod_diagnostics_script(cfg)], capture_output=True, text=True)
+            assert "Listening on http://0.0.0.0:8765" in diag.stdout
+            # >= 1: on a dev machine unrelated shells may mention "chisel server" in their command line
+            assert re.search(r"chisel server processes: [1-9]", diag.stdout), diag.stdout
+        finally:
+            for pid in _running(binary):
+                os.kill(pid, signal.SIGKILL)
+
+    def test_server_that_dies_fails_the_start_with_its_log(self, tmp_path):
+        binary = tmp_path / "chisel-srv"
+        cfg = _fake_server(binary, 'echo "server: listen tcp 0.0.0.0:$5: bind: address already in use"; exit 1\n')
+        res = subprocess.run(
+            ["sh", "-c", server_start_script(cfg, wait_s=1)], capture_output=True, text=True, timeout=20
+        )
+        assert res.returncode == 1
+        assert "not listening after 1s" in res.stdout and "address already in use" in res.stdout
+
+    def test_server_start_fails_without_binary(self, tmp_path):
+        cfg = ModelTunnelConfig(chisel_dir=str(tmp_path), pod_binary=str(tmp_path / "missing"))
+        res = subprocess.run(["sh", "-c", server_start_script(cfg, wait_s=1)], capture_output=True, timeout=20)
+        assert res.returncode == 1
