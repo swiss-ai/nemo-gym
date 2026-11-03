@@ -20,6 +20,7 @@ from asyncio import Semaphore
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 import ray
@@ -283,6 +284,7 @@ class HarborAgent(SimpleResponsesAPIAgent):
 
             policy_model_name = global_config_dict["policy_model_name"]
             base_url = self._resolve_model_base_url(global_config_dict, body)
+            model_tunnel = self._model_tunnel_kwargs(global_config_dict)
             run_timestamp = datetime.now(timezone.utc)
             run_id = self._build_run_id(run_timestamp)
 
@@ -306,6 +308,7 @@ class HarborAgent(SimpleResponsesAPIAgent):
                 job_name=job_name,
                 jobs_dir=jobs_dir,
                 responses_create_params=responses_create_params,
+                model_tunnel=model_tunnel,
             )
 
             try:
@@ -464,13 +467,26 @@ class HarborAgent(SimpleResponsesAPIAgent):
         if self.config.harbor_model_base_url:
             root = self.config.harbor_model_base_url.rstrip("/").removesuffix("/v1")
         else:
-            server_name = self.config.model_server.name
-            model_server_config = get_first_server_config_dict(
-                global_config_dict,
-                server_name,
-            )
-            root = f"http://{model_server_config['host']}:{model_server_config['port']}"
+            root = self._model_server_root(global_config_dict)
         return f"{self.base_url_for_run(root, body)}/v1"
+
+    def _model_server_root(self, global_config_dict: Any) -> str:
+        model_server_config = get_first_server_config_dict(global_config_dict, self.config.model_server.name)
+        return f"http://{model_server_config['host']}:{model_server_config['port']}"
+
+    def _model_tunnel_kwargs(self, global_config_dict: Any) -> Optional[dict[str, Any]]:
+        """``harbor_environment_kwargs.model_tunnel`` with ``target`` defaulted to the model server.
+
+        The model server's port is only known at run time, so the environment (which opens the tunnel
+        from the Harbor process to that host:port) gets it from here.
+        """
+        raw = (self.config.harbor_environment_kwargs or {}).get("model_tunnel")
+        if not raw:
+            return None
+        tunnel = dict(raw)
+        if not tunnel.get("target"):
+            tunnel["target"] = urlsplit(self._model_server_root(global_config_dict)).netloc
+        return tunnel
 
     def _build_job_config(
         self,
@@ -481,6 +497,7 @@ class HarborAgent(SimpleResponsesAPIAgent):
         job_name: str,
         jobs_dir: Path,
         responses_create_params: Optional[dict[str, Any]] = None,
+        model_tunnel: Optional[dict[str, Any]] = None,
     ) -> dict:
         """Build a Harbor JobConfig dict for a single task."""
         from harbor.models.job.config import (
@@ -540,6 +557,9 @@ class HarborAgent(SimpleResponsesAPIAgent):
         # Dataset alias-level workdir overrides global harbor_environment_kwargs.workdir.
         if dataset_source.workdir is not None:
             environment_kwargs["workdir"] = dataset_source.workdir
+        # resolved per run (target = model server), replaces the static copy from harbor_environment_kwargs
+        if model_tunnel is not None:
+            environment_kwargs["model_tunnel"] = model_tunnel
 
         environment_config = EnvironmentConfig(
             type=self.config.harbor_environment_type if not self.config.harbor_environment_import_path else None,

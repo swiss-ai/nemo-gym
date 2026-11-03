@@ -513,6 +513,42 @@ class TestApp:
             == "https://proxy.example.org/gym/ng-rollout/3-1/training-token-capture/v1"
         )
 
+    def test_model_tunnel_kwargs_absent_without_config(self) -> None:
+        assert _make_server()._model_tunnel_kwargs(_GLOBAL_CONFIG) is None
+        server = _make_server(harbor_environment_kwargs={"workdir": "/w"})
+        assert server._model_tunnel_kwargs(_GLOBAL_CONFIG) is None
+
+    def test_model_tunnel_target_defaults_to_model_server(self) -> None:
+        server = _make_server(harbor_environment_kwargs={"model_tunnel": {"chisel_dir": "/c", "pod_port": 8001}})
+        assert server._model_tunnel_kwargs(_GLOBAL_CONFIG) == {
+            "chisel_dir": "/c",
+            "pod_port": 8001,
+            "target": "policy-host:9000",
+        }
+        # the config itself is not mutated (it is shared by all runs)
+        assert "target" not in server.config.harbor_environment_kwargs["model_tunnel"]
+
+    def test_model_tunnel_explicit_target_wins(self) -> None:
+        server = _make_server(harbor_environment_kwargs={"model_tunnel": {"chisel_dir": "/c", "target": "gw:1"}})
+        assert server._model_tunnel_kwargs(_GLOBAL_CONFIG)["target"] == "gw:1"
+
+    def test_build_job_config_passes_resolved_model_tunnel(self) -> None:
+        pytest.importorskip("harbor")
+        server = _make_server(harbor_environment_kwargs={"model_tunnel": {"chisel_dir": "/c"}, "workdir": "/w"})
+        config = server._build_job_config(
+            dataset_alias="scientific",
+            task_name="test_task_123",
+            model_name="test_model",
+            api_base="http://policy-host:9000/v1",
+            job_name="test_job",
+            jobs_dir=Path("/tmp/harbor_jobs"),
+            model_tunnel={"chisel_dir": "/c", "target": "policy-host:9000"},
+        )
+        assert config["environment"]["kwargs"]["model_tunnel"] == {"chisel_dir": "/c", "target": "policy-host:9000"}
+        assert config["environment"]["kwargs"]["workdir"] == "/w"
+        # Terminus-2 keeps calling the model from the node
+        assert config["agents"][0]["kwargs"]["api_base"] == "http://policy-host:9000/v1"
+
     def test_build_job_config_uses_daytona_type_when_import_path_is_clear(self) -> None:
         pytest.importorskip("harbor")
         server = _make_server(

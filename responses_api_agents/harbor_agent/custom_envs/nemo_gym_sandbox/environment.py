@@ -48,6 +48,10 @@ from nemo_gym.sandbox import (
     rewrite_image,
 )
 from nemo_gym.sandbox.utils import cpu_cap_env
+from responses_api_agents.harbor_agent.custom_envs.nemo_gym_sandbox.model_tunnel import (
+    ModelTunnel,
+    ModelTunnelConfig,
+)
 
 
 # The sandbox-side scratch directory used for tar-based directory transfer.
@@ -121,6 +125,13 @@ class NemoGymSandboxEnvironment(BaseEnvironment):
             ``allow_internet = false``) even though this environment cannot
             enforce it (default False). Each affected trial logs a prominent
             warning.
+        model_tunnel: Open a per-sandbox reverse tunnel so code inside the
+            sandbox reaches the model server at ``127.0.0.1:<pod_port>``
+            (for clusters where sandboxes cannot reach the training nodes).
+            See ``model_tunnel.ModelTunnelConfig``; harbor_agent fills
+            ``target`` with the model server. Unset: no tunnel. Only the
+            agent's environment opens it, not a separate verifier
+            environment (``_tunnel_config``).
     """
 
     def __init__(
@@ -139,6 +150,7 @@ class NemoGymSandboxEnvironment(BaseEnvironment):
         image_rewrites: Optional[list[Mapping[str, str]]] = None,
         workdir: Optional[str] = None,
         allow_unenforced_internet_isolation: bool = False,
+        model_tunnel: Optional[Mapping[str, Any]] = None,
         **kwargs,
     ):
         # Set before super().__init__: the base constructor runs the
@@ -157,6 +169,8 @@ class NemoGymSandboxEnvironment(BaseEnvironment):
         self._workdir = workdir
         self._allow_unenforced_internet_isolation = allow_unenforced_internet_isolation
         self._sandbox: Optional[AsyncSandbox] = None
+        self._model_tunnel_config = ModelTunnelConfig.from_mapping(model_tunnel) if model_tunnel else None
+        self._model_tunnel: Optional[ModelTunnel] = None
 
         super().__init__(*args, **kwargs)
 
@@ -206,6 +220,29 @@ class NemoGymSandboxEnvironment(BaseEnvironment):
         )
 
     @property
+    def is_separate_verifier_environment(self) -> bool:
+        """Whether Harbor built this environment for a separate verifier.
+
+        Tasks with ``[verifier] environment_mode = "separate"`` get a second environment for the
+        verifier, created from the same environment config (harbor trial/trial.py
+        ``_separate_verifier_env``), so it receives this environment's kwargs too. Harbor tells the
+        two apart only by the session id, ``{trial_name}__{role}``: ``{trial_name}__env`` for the
+        agent's environment and ``{trial_name}__verifier__{key}`` for a separate verifier's
+        (``Trial._separate_verifier_session_id``; ``BaseEnvironment`` docstring).
+        """
+        return "__verifier__" in (self.session_id or "")
+
+    @property
+    def _tunnel_config(self) -> Optional[ModelTunnelConfig]:
+        """The model tunnel to open, or None. Only the agent calls the model server, so a separate
+        verifier environment gets no tunnel: it would only add a chisel upload, a health check and
+        one more way for the verifier pod to fail, and give the verifier access to the policy model.
+        """
+        if self._model_tunnel_config is None or self.is_separate_verifier_environment:
+            return None
+        return self._model_tunnel_config
+
+    @property
     def _resolved_image(self) -> str:
         return rewrite_image(self.task_env_config.docker_image, self._image_rewrites)
 
@@ -236,6 +273,8 @@ class NemoGymSandboxEnvironment(BaseEnvironment):
             env={**(cpu_cap_env(resources.get("cpu")) if self._derive_cpu_env else {}), **self._sandbox_env},
             metadata=metadata,
             resources=resources,
+            # declared so sandbox.endpoint() resolves the tunnel's server port
+            ports=(self._tunnel_config.server_port,) if self._tunnel_config else (),
             provider_options=dict(self._sandbox_provider_options),
         )
 
@@ -269,12 +308,22 @@ class NemoGymSandboxEnvironment(BaseEnvironment):
                 f"Failed to create log directories in sandbox: {result.stderr or result.stdout or '<no output>'}"
             )
 
+        tunnel_config = self._tunnel_config
+        if tunnel_config is not None:
+            # On failure the tunnel cleans up after itself; stop() still deletes the sandbox.
+            tunnel = ModelTunnel(sandbox, tunnel_config, self.logger, label=f" [{self.session_id}]")
+            await tunnel.open()
+            self._model_tunnel = tunnel
+
     def _require_sandbox(self) -> AsyncSandbox:
         if self._sandbox is None:
             raise RuntimeError("Sandbox is not running; call start() first.")
         return self._sandbox
 
     async def stop(self, delete: bool):
+        tunnel, self._model_tunnel = self._model_tunnel, None
+        if tunnel is not None:
+            await tunnel.close()
         if self._sandbox is None:
             return
         if not delete:
