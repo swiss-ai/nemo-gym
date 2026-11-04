@@ -20,8 +20,10 @@ MiniSweAgentNemoGym writes this file into the sandbox and passes its settings as
 
 - ``model_kwargs`` replace those of mini's config (its default ``mini.yaml`` has ``temperature: 0.0``):
   the rollout's ``api_base``/``api_key`` and the on-policy sampling parameters.
-- ``max_calls`` > 0 ends the run with mini's ``LimitsExceeded`` (a normal end, the verifier still runs)
-  before that many model calls are exceeded; mini's own step limit lives in the agent config.
+- ``max_calls`` > 0 ends the run with ``CallLimitReached`` (a TerminatingException: a normal end with
+  that exit status, the verifier still runs) before that many model calls are exceeded; mini's own step
+  limit lives in the agent config. Not mini's ``LimitsExceeded``: ``mini`` runs InteractiveAgent, whose
+  ``query`` catches it and asks for a new limit on stdin (/dev/null -> EOFError; job 5255374).
 
 Messages are sent with ``role`` and ``content`` only: mini stores each assistant reply with an
 ``extra`` field (the raw response), and Gym's model server rejects unknown message fields with 422
@@ -35,13 +37,17 @@ import json
 import os
 
 import litellm
-from minisweagent.agents.default import LimitsExceeded
+from minisweagent.agents.default import TerminatingException
 from minisweagent.models.litellm_model import LitellmModel
 
 
 SETTINGS = json.loads(os.environ.get("NEMO_GYM_MINI") or "{}")
 
 litellm.cost_calculator.completion_cost = lambda *args, **kwargs: 0.0
+
+
+class CallLimitReached(TerminatingException):
+    pass
 
 
 class NemoGymModel(LitellmModel):
@@ -53,6 +59,6 @@ class NemoGymModel(LitellmModel):
 
     def query(self, messages, **kwargs):
         if 0 < self.max_calls <= self.n_calls:
-            raise LimitsExceeded(f"Model call limit reached ({self.max_calls}).")
+            raise CallLimitReached(f"Model call limit reached ({self.max_calls}).")
         sent = [{"role": m["role"], "content": m["content"]} for m in messages]
         return super().query(sent, **kwargs)
