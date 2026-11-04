@@ -23,6 +23,10 @@ MiniSweAgentNemoGym writes this file into the sandbox and passes its settings as
 - ``max_calls`` > 0 ends the run with mini's ``LimitsExceeded`` (a normal end, the verifier still runs)
   before that many model calls are exceeded; mini's own step limit lives in the agent config.
 
+Messages are sent with ``role`` and ``content`` only: mini stores each assistant reply with an
+``extra`` field (the raw response), and Gym's model server rejects unknown message fields with 422
+(``extra_forbidden``), which failed every second call (job 5253837).
+
 The cost lookup is disabled: the Gym model server's model is not in litellm's price list, and
 mini-swe-agent re-raises every cost-calculation error, which would fail every call.
 """
@@ -50,4 +54,5 @@ class NemoGymModel(LitellmModel):
     def query(self, messages, **kwargs):
         if 0 < self.max_calls <= self.n_calls:
             raise LimitsExceeded(f"Model call limit reached ({self.max_calls}).")
-        return super().query(messages, **kwargs)
+        sent = [{"role": m["role"], "content": m["content"]} for m in messages]
+        return super().query(sent, **kwargs)

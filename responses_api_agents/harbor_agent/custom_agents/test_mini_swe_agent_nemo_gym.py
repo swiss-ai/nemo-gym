@@ -162,7 +162,11 @@ _STUBS = {
                 cost = litellm.cost_calculator.completion_cost(None)  # mini re-raises errors here
                 self.n_calls += 1
                 self.cost += cost
-                return {"content": f"call {self.n_calls}", "kwargs": self.model_kwargs}
+                return {
+                    "content": f"call {self.n_calls}",
+                    "kwargs": self.model_kwargs,
+                    "sent": messages,
+                }
         """
     ),
 }
@@ -178,9 +182,14 @@ _FAKE_MINI = textwrap.dedent(
     m = Model(model_name=args[args.index("-m") + 1], model_kwargs={{"temperature": 0.0, "drop_params": True}})
     out = []
     from minisweagent.agents.default import LimitsExceeded
+    # mini's history: assistant replies carry `extra` (the raw response), as in DefaultAgent.add_message
+    history = [{{"role": "system", "content": "sys"}}, {{"role": "user", "content": "task"}}]
     for _ in range(3):
         try:
-            out.append(m.query([]))
+            reply = m.query(list(history))
+            out.append(reply)
+            history += [{{"role": "assistant", "content": reply["content"], "extra": {{"response": {{}}}}}},
+                        {{"role": "user", "content": "observation"}}]
         except LimitsExceeded as e:
             out.append({{"limit": str(e)}})
     print(json.dumps({{"task": args[args.index("-t") + 1], "out": out, "cost": m.cost}}))
@@ -226,6 +235,10 @@ def test_run_command_in_bash_loads_the_model_class(tmp_path: Path) -> None:
         "api_key": "EMPTY",
     }
     assert second["content"] == "call 2"
+    # the second call carries mini's assistant reply; only role/content may reach the model server,
+    # which rejects unknown message fields with 422 (job 5253837: every second call failed)
+    assert second["sent"][2] == {"role": "assistant", "content": "call 1"}
+    assert all(set(msg) == {"role", "content"} for msg in second["sent"])
     assert third == {"limit": "Model call limit reached (2)."}
     assert result["cost"] == 0.0
     assert (logs / "agent" / "mini-swe-agent.txt").read_text() == res.stdout
