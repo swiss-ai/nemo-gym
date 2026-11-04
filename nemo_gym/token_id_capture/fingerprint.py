@@ -45,7 +45,7 @@ import orjson
 
 # Increment when fingerprint canonicalization or hash layout changes.
 # Resolvers ignore entries stamped with a different version.
-FINGERPRINT_VERSION = 3
+FINGERPRINT_VERSION = 4
 
 _FINGERPRINT_DOMAIN = b"nemo-gym-lineage"
 _CONTEXT_DOMAIN = b"nemo-gym-lineage-context"
@@ -58,22 +58,42 @@ def assistant_fingerprint(messages: list[dict]) -> str:
     The fingerprint identifies the call that produced the last model-authored turn.
     User and tool content is excluded from the lookup key.
     Dialect-specific tool-call shapes normalize to the same hash input.
+
+    A turn is a run of consecutive model-authored items.
+    A turn with no text and no tool call (an empty reply) hashes an explicit marker.
+    Without it, the call that produced an empty reply would share its parent's fingerprint.
+    The next request would then match both calls and resolve as ambiguous.
+    Non-empty turns hash exactly as before, so their fingerprints do not change.
     """
     hasher = hashlib.sha256(_FINGERPRINT_DOMAIN)
     count = 0
+    # Whether the current run of consecutive model-authored items hashed any field.
+    # ``None`` means no run is open.
+    run_hashed: bool | None = None
     for message in messages or []:
         if not isinstance(message, dict):
             raise ValueError(f"request item is not an object: {type(message).__name__}")
         if not _is_assistant_authored(message):
+            if message.get("type") == "reasoning":
+                # Excluded like reasoning content; it neither opens nor closes a turn.
+                continue
+            if run_hashed is False:
+                _update_field(hasher, b"\x05", "")
+            run_hashed = None
             continue
         count += 1
+        run_hashed = bool(run_hashed)
         for content_type, payload in _content_of(message.get("content")):
             _update_field(hasher, b"\x00", content_type)
             _update_field(hasher, b"\x01", payload)
+            run_hashed = True
         for call_id, name, arguments in _tools_of(message):
             _update_field(hasher, b"\x02", call_id)
             _update_field(hasher, b"\x03", name)
             _update_field(hasher, b"\x04", arguments)
+            run_hashed = True
+    if run_hashed is False:
+        _update_field(hasher, b"\x05", "")
     if count == 0:
         return ""
     return hasher.hexdigest()

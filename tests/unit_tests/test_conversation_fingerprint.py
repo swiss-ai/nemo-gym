@@ -119,3 +119,52 @@ def test_conversation_digest_ignores_instruction_content_but_not_its_position():
     assert conversation_digest(day1) != conversation_digest([*day1[:2], dict(day1[2], content="done")])
     # The assistant fingerprint never looked at instruction items.
     assert assistant_fingerprint(day1) == assistant_fingerprint(day2)
+
+
+def test_an_empty_assistant_turn_still_counts_as_a_turn():
+    # An agent that answers a parse error with a re-prompt echoes the model's
+    # empty reply. If empty turns hashed as nothing, the call that produced the
+    # empty reply would share its fingerprint with its parent, and the next
+    # request would match both (unresolved parent, job 5256202).
+    answer = {"role": "assistant", "content": "answer"}
+    empty = {"role": "assistant", "content": ""}
+    retry = {"role": "user", "content": "Previous response had parsing errors"}
+    one = assistant_fingerprint([answer, retry, empty])
+    two = assistant_fingerprint([answer, retry, empty, retry, empty])
+    assert len({assistant_fingerprint([answer]), one, two}) == 3
+    assert assistant_fingerprint([empty]) != assistant_fingerprint([empty, retry, empty])
+
+
+def test_an_empty_assistant_turn_hashes_identically_across_dialects():
+    shapes = [
+        {"role": "assistant", "content": ""},
+        {"role": "assistant", "content": None},
+        {"role": "assistant", "content": []},
+        {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "", "annotations": []}]},
+        {"role": "assistant", "content": [{"type": "text", "text": ""}]},
+        # A standalone reasoning item is excluded; it neither adds nor splits a turn.
+        [{"type": "reasoning", "summary": []}, {"role": "assistant", "content": ""}],
+    ]
+    fingerprints = {assistant_fingerprint(shape if isinstance(shape, list) else [shape]) for shape in shapes}
+    assert len(fingerprints) == 1 and fingerprints != {""}
+
+
+def test_an_empty_text_part_next_to_a_tool_call_is_not_an_empty_turn():
+    # Chat sends a tool-call-only turn with content None or "", Responses may
+    # add an empty message item before the function_call item. All of them
+    # carry the same model output and must keep hashing the same.
+    call = {"type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}"}
+    chat_none = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [{"id": "c1", "function": {"name": "f", "arguments": "{}"}}],
+    }
+    chat_empty = dict(chat_none, content="")
+    responses_with_empty_message = [{"type": "message", "role": "assistant", "content": []}, call]
+    fingerprints = {
+        assistant_fingerprint([call]),
+        assistant_fingerprint([chat_none]),
+        assistant_fingerprint([chat_empty]),
+        assistant_fingerprint(responses_with_empty_message),
+    }
+    assert len(fingerprints) == 1
