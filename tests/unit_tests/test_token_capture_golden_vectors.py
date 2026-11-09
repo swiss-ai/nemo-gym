@@ -69,6 +69,22 @@ VECTORS = {
             ],
             "expected": "82955bc805cccaf9d2faa840479ff6c30420d20e42bf2bc1ebef14d679ec3768",  # pragma: allowlist secret
         },
+        # Version 3: reasoning folded into the reply as a leading think block is not hashed.
+        "think_wrapped": {
+            "input": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "<think>greet back</think>hi there"},
+            ],
+            "expected": "5b20b01e7ca4ec80db6e221c277c02a796f6a2b90e81c7adaf7f1b8fc2c6846e",  # pragma: allowlist secret
+        },
+        # A reasoning-only reply hashes as an empty turn (the version 2 empty-turn marker).
+        "think_only": {
+            "input": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "<think>nothing to add</think>"},
+            ],
+            "expected": "aba48d04cb2f6e8ef9214c77495123d5236dd8e3966c97073686a3b37bf4ebff",  # pragma: allowlist secret
+        },
         "empty": {"input": [], "expected": ""},
     },
     "conversation_digest": {
@@ -145,6 +161,10 @@ def test_fingerprint_vectors():
 def test_fingerprint_is_identical_across_dialects():
     values = {VECTORS["fingerprint"][k]["expected"] for k in ("chat_tool", "anthropic_tool", "responses_tool")}
     assert len(values) == 1
+
+
+def test_think_wrapped_reply_hashes_as_its_content():
+    assert VECTORS["fingerprint"]["think_wrapped"]["expected"] == VECTORS["fingerprint"]["plain"]["expected"]
 
 
 def test_conversation_digest_vectors():

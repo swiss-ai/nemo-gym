@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from typing import Any
 
 import orjson
@@ -45,11 +46,14 @@ import orjson
 
 # Increment when fingerprint canonicalization or hash layout changes.
 # Resolvers ignore entries stamped with a different version.
-FINGERPRINT_VERSION = 4
+FINGERPRINT_VERSION = 5
 
 _FINGERPRINT_DOMAIN = b"nemo-gym-lineage"
 _CONTEXT_DOMAIN = b"nemo-gym-lineage-context"
 _INSTRUCTION_ROLES = frozenset({"system", "developer"})
+
+# The reasoning that a model server folds into assistant text: one or more ``<think>...</think>`` blocks at the start.
+_LEADING_THINK_BLOCKS = re.compile(r"(?:<think>.*?</think>)+", re.DOTALL)
 
 
 def assistant_fingerprint(messages: list[dict]) -> str:
@@ -64,6 +68,12 @@ def assistant_fingerprint(messages: list[dict]) -> str:
     Without it, the call that produced an empty reply would share its parent's fingerprint.
     The next request would then match both calls and resolve as ambiguous.
     Non-empty turns hash exactly as before, so their fingerprints do not change.
+
+    Reasoning folded into assistant text is excluded like standalone reasoning items.
+    A server with a reasoning parser returns ``<think>REASONING</think>`` + content.
+    A harness may echo that text verbatim or only the content after the block.
+    Both echoes must find the call, so leading think blocks are stripped before hashing.
+    A turn left with no text and no tool call hashes the empty-turn marker.
     """
     hasher = hashlib.sha256(_FINGERPRINT_DOMAIN)
     count = 0
@@ -83,7 +93,7 @@ def assistant_fingerprint(messages: list[dict]) -> str:
             continue
         count += 1
         run_hashed = bool(run_hashed)
-        for content_type, payload in _content_of(message.get("content")):
+        for content_type, payload in _strip_leading_reasoning(_content_of(message.get("content"))):
             _update_field(hasher, b"\x00", content_type)
             _update_field(hasher, b"\x01", payload)
             run_hashed = True
@@ -210,6 +220,23 @@ def _content_of(content: Any) -> list[tuple[str, str]]:
             raise ValueError("content block has no supported type")
         parts.append((block_type, _canonical_json(block)))
     return parts
+
+
+def _strip_leading_reasoning(parts: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Drop the think blocks that open a model-authored item's text.
+
+    ``_wrap_reasoning_in_think_tags`` puts reasoning only at the start of the content.
+    Clients that split it back out (LiteLLM) take one leading block and keep the rest verbatim.
+    Stripping the whole leading run makes both echoes agree, even when the visible text starts with a block.
+    Think blocks later in the text are visible model output and stay hashed.
+    """
+    if not parts or parts[0][0] != "text":
+        return parts
+    match = _LEADING_THINK_BLOCKS.match(parts[0][1])
+    if match is None:
+        return parts
+    rest = parts[0][1][match.end() :]
+    return ([("text", rest)] if rest else []) + parts[1:]
 
 
 def _tools_of(message: dict) -> list[tuple[str, str, str]]:
