@@ -91,6 +91,12 @@ _VERSION_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z.+-]*$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
+# The sandbox exec may run the command with /bin/sh (OpenSandbox runs `su -s /bin/sh -c` for a
+# named user). A plain `set -o pipefail` is a special-builtin error in a shell without it (older
+# dash), which ends a non-interactive shell before OpenCode starts. Probe in a subshell first.
+PIPEFAIL_IF_SUPPORTED = "(set -o pipefail) 2>/dev/null && set -o pipefail; "
+
+
 def deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
     """`base` updated by `overlay`, recursing into dicts; a None value in `overlay` deletes the key."""
     merged = copy.deepcopy(base)
@@ -299,7 +305,7 @@ class OpenCodeNemoGym(OpenCode):
         # stdin from /dev/null: with a non-TTY stdin `opencode run` reads it to EOF before doing
         # anything (cli/cmd/run.ts:399), and the sandbox exec leaves it open. pipefail keeps
         # OpenCode's exit status (e.g. 124 from timeout) instead of tee's.
-        command = f"set -o pipefail; {shlex.join(argv)} 2>&1 </dev/null | tee {LOG_FILE}"
+        command = f"{PIPEFAIL_IF_SUPPORTED}{shlex.join(argv)} 2>&1 </dev/null | tee {LOG_FILE}"
         if self._install_method == "npm":
             command = f"{NVM_PREFIX}{command}"
         return [ExecInput(command=command, env=self.opencode_env())]

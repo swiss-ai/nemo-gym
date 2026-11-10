@@ -67,7 +67,7 @@ def test_requires_api_base(tmp_path: Path) -> None:
 def test_run_command(tmp_path: Path) -> None:
     (cmd,) = _agent(tmp_path).create_run_agent_commands("print 'hi' > /app/out.txt")
     assert cmd.command == (
-        f"set -o pipefail; opencode --model nemogym/{MODEL} run --format=json --title 'NeMo Gym' "
+        f"{mod.PIPEFAIL_IF_SUPPORTED}opencode --model nemogym/{MODEL} run --format=json --title 'NeMo Gym' "
         "-- 'print '\"'\"'hi'\"'\"' > /app/out.txt' 2>&1 </dev/null | tee /logs/agent/opencode.txt"
     )
     assert "timeout" not in cmd.command
@@ -76,7 +76,9 @@ def test_run_command(tmp_path: Path) -> None:
 
 def test_run_command_timeout_wrapper_and_debug_logs(tmp_path: Path) -> None:
     (cmd,) = _agent(tmp_path, opencode_timeout_sec=870, opencode_debug=True).create_run_agent_commands("-x")
-    assert cmd.command.startswith(f"set -o pipefail; timeout -k 10 870 opencode --model nemogym/{MODEL} run ")
+    assert cmd.command.startswith(
+        f"{mod.PIPEFAIL_IF_SUPPORTED}timeout -k 10 870 opencode --model nemogym/{MODEL} run "
+    )
     assert "--title 'NeMo Gym' --print-logs --log-level DEBUG -- -x 2>&1 </dev/null |" in cmd.command
 
 
@@ -119,6 +121,28 @@ def test_run_command_in_bash_closes_stdin_and_keeps_the_exit_status(
     assert lines == proc.stdout.splitlines()
     assert lines[-3:] == ["--", "-fix it", "stdin=[]"]
     assert lines[:5] == ["--model", f"nemogym/{MODEL}", "run", "--format=json", "--title"]
+
+
+@pytest.mark.parametrize("shell", ["sh", "dash"])
+def test_run_command_starts_opencode_in_a_posix_sh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shell: str
+) -> None:
+    """The sandbox exec may use /bin/sh; a shell without pipefail must still run OpenCode."""
+    if shutil.which(shell) is None:
+        pytest.skip(f"needs {shell}")
+    log = tmp_path / "opencode.txt"
+    monkeypatch.setattr(mod, "LOG_FILE", str(log))
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake = bin_dir / "opencode"
+    fake.write_text("#!/bin/sh\necho started\nexit 3\n")
+    fake.chmod(0o755)
+    (cmd,) = _agent(tmp_path).create_run_agent_commands("x")
+    env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
+    proc = subprocess.run([shell, "-c", cmd.command], capture_output=True, text=True, env=env, timeout=20)
+    supports_pipefail = subprocess.run([shell, "-c", "set -o pipefail"], capture_output=True).returncode == 0
+    assert log.read_text().splitlines() == ["started"]
+    assert proc.returncode == (3 if supports_pipefail else 0)
 
 
 # --- environment ---------------------------------------------------------------------------------
