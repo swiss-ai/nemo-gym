@@ -125,6 +125,7 @@ class OpenCodeNemoGym(OpenCode):
         opencode_install: str = "binary",
         opencode_sha256: str | None = None,
         opencode_asset: str = DEFAULT_ASSET,
+        opencode_workdir: str | None = None,
         **kwargs: Any,
     ) -> None:
         # Harbor's base keeps `version` (the OpenCode release, or the npm version for "npm").
@@ -141,6 +142,8 @@ class OpenCodeNemoGym(OpenCode):
             raise ValueError(f"invalid OpenCode version {self._version!r}")
         if opencode_sha256 is not None and not _SHA256_RE.match(opencode_sha256):
             raise ValueError("opencode_sha256 must be 64 lowercase hex digits")
+        if opencode_workdir is not None and not str(opencode_workdir).startswith("/"):
+            raise ValueError(f"opencode_workdir must be an absolute path, got {opencode_workdir!r}")
         self._api_base = api_base
         self._api_key = api_key
         # Kept for reference; sampling values reach vLLM through vllm_model.sampling_overrides.
@@ -152,6 +155,7 @@ class OpenCodeNemoGym(OpenCode):
         self._debug = bool(opencode_debug)
         self._install_method = opencode_install
         self._asset = opencode_asset
+        self._workdir = opencode_workdir
         self._sha256 = opencode_sha256 or KNOWN_ARCHIVE_SHA256.get((self._version, opencode_asset))
 
     @staticmethod
@@ -306,6 +310,13 @@ class OpenCodeNemoGym(OpenCode):
         # anything (cli/cmd/run.ts:399), and the sandbox exec leaves it open. pipefail keeps
         # OpenCode's exit status (e.g. 124 from timeout) instead of tee's.
         command = f"{PIPEFAIL_IF_SUPPORTED}{shlex.join(argv)} 2>&1 </dev/null | tee {LOG_FILE}"
+        if self._workdir:
+            # OpenCode's project is its cwd; the sandbox exec starts in / (or $HOME), where OpenCode
+            # warns "failed to initialize fff ... file system root or home directory" and the whole
+            # file system is the project (job 5314432). Tasks may expect the agent to create the
+            # directory, so create it; if that fails, OpenCode still runs in the exec's cwd.
+            workdir = shlex.quote(self._workdir)
+            command = f"mkdir -p {workdir} && cd {workdir}; {command}"
         if self._install_method == "npm":
             command = f"{NVM_PREFIX}{command}"
         return [ExecInput(command=command, env=self.opencode_env())]

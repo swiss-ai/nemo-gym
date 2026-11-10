@@ -145,6 +145,32 @@ def test_run_command_starts_opencode_in_a_posix_sh(
     assert proc.returncode == (3 if supports_pipefail else 0)
 
 
+def test_run_command_workdir(tmp_path: Path) -> None:
+    (plain,) = _agent(tmp_path).create_run_agent_commands("x")
+    assert not plain.command.startswith("mkdir")
+    (cmd,) = _agent(tmp_path, opencode_workdir="/app").create_run_agent_commands("x")
+    assert cmd.command == f"mkdir -p /app && cd /app; {plain.command}"
+    with pytest.raises(ValueError, match="absolute"):
+        _agent(tmp_path, opencode_workdir="app")
+
+
+@needs_bash
+def test_run_command_starts_opencode_in_the_created_workdir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    log = tmp_path / "opencode.txt"
+    monkeypatch.setattr(mod, "LOG_FILE", str(log))
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake = bin_dir / "opencode"
+    fake.write_text("#!/bin/sh\npwd\n")
+    fake.chmod(0o755)
+    workdir = tmp_path / "does" / "not" / "exist yet"
+    (cmd,) = _agent(tmp_path, opencode_workdir=str(workdir)).create_run_agent_commands("x")
+    env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
+    proc = subprocess.run(["bash", "-c", cmd.command], cwd="/", capture_output=True, text=True, env=env, timeout=20)
+    assert proc.returncode == 0
+    assert log.read_text().splitlines() == [str(workdir)]
+
+
 # --- environment ---------------------------------------------------------------------------------
 
 
