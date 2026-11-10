@@ -106,6 +106,9 @@ class HarborAgentConfig(BaseResponsesAPIAgentConfig):
     harbor_verifier_max_timeout: Optional[int] = None
     # Multiplier applied to all Harbor timeouts after override/cap. None = 1.0.
     harbor_timeout_multiplier: Optional[float] = None
+    # Also mask rollouts whose agent hit its timeout (AgentTimeoutError), even when the verifier
+    # ran. Off by default: such a rollout then trains with the verifier's reward.
+    harbor_mask_agent_timeout: bool = False
 
     # --- Job output ---
     # Directory where Harbor writes job results and trial artifacts.
@@ -132,6 +135,11 @@ class HarborRunRequest(BaseRunRequest):
 
 class HarborVerifyResponse(BaseVerifyResponse):
     model_config = ConfigDict(extra="allow")
+
+
+def _exception_type(trial_result: Optional[dict]) -> Optional[str]:
+    """Harbor's exception_info.exception_type of a trial result dict (e.g. "AgentTimeoutError")."""
+    return ((trial_result or {}).get("exception_info") or {}).get("exception_type")
 
 
 def _find_trial_dir_with_result(job_dir: Path) -> Optional[Path]:
@@ -393,9 +401,7 @@ class HarborAgent(SimpleResponsesAPIAgent):
                 instance_config={"mask_sample": self._should_mask(trial_result, output_items)},
                 context_length_exceeded_error=int(agent_error_flags.get("context_length_exceeded", False)),
                 memory_limit_exceeded_error=int(agent_error_flags.get("memory_limit_exceeded", False)),
-                agent_timeout_error=int(
-                    ((trial_result or {}).get("exception_info") or {}).get("exception_type") == "AgentTimeoutError"
-                ),
+                agent_timeout_error=int(_exception_type(trial_result) == "AgentTimeoutError"),
             )
 
             # Save result to disk (folder = run_id, file = task name)
@@ -466,7 +472,10 @@ class HarborAgent(SimpleResponsesAPIAgent):
         (and masks it itself when no call chain was captured); agents such as OpenCode write no ATIF
         trajectory at all, so empty output is expected there. The rollout is still masked when the
         trial failed or the verifier never produced a result, since its reward then means nothing.
+        With `harbor_mask_agent_timeout`, a trial that ended in AgentTimeoutError is masked as well.
         """
+        if self.config.harbor_mask_agent_timeout and _exception_type(trial_result) == "AgentTimeoutError":
+            return True
         if not self._token_id_capture_enabled():
             return not output_items
         return trial_result is None or not trial_result.get("verifier_result")

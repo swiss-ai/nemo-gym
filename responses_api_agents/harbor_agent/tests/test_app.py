@@ -518,6 +518,21 @@ class TestApp:
         assert server._should_mask(None, []) is True
         # trial ended without a verifier result (setup or agent crash)
         assert server._should_mask({"verifier_result": None}, [{"type": "message"}]) is True
+        # an agent timeout with a verifier result trains by default
+        timed_out = {**verified, "exception_info": {"exception_type": "AgentTimeoutError"}}
+        assert server._should_mask(timed_out, []) is False
+
+    @pytest.mark.parametrize("token_id_capture", [False, True])
+    def test_mask_agent_timeout_is_opt_in(self, token_id_capture: bool) -> None:
+        server = _make_server(token_id_capture=token_id_capture, harbor_mask_agent_timeout=True)
+        server.server_client.global_config_dict = {"token_id_capture": {"enabled": token_id_capture}}
+        verified = {"verifier_result": {"rewards": {"reward": 1.0}}}
+        timed_out = {**verified, "exception_info": {"exception_type": "AgentTimeoutError"}}
+        other_error = {**verified, "exception_info": {"exception_type": "NonZeroAgentExitCodeError"}}
+        output = [{"type": "message"}]
+        assert server._should_mask(timed_out, output) is True
+        assert server._should_mask(other_error, output) is False
+        assert server._should_mask(verified, output) is False
 
     def test_model_base_url_capture_needs_agent_opt_in(self) -> None:
         server = _make_server()
