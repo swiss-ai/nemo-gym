@@ -46,7 +46,7 @@ import orjson
 
 # Increment when fingerprint canonicalization or hash layout changes.
 # Resolvers ignore entries stamped with a different version.
-FINGERPRINT_VERSION = 5
+FINGERPRINT_VERSION = 6
 
 _FINGERPRINT_DOMAIN = b"nemo-gym-lineage"
 _CONTEXT_DOMAIN = b"nemo-gym-lineage-context"
@@ -54,6 +54,14 @@ _INSTRUCTION_ROLES = frozenset({"system", "developer"})
 
 # The reasoning that a model server folds into assistant text: one or more ``<think>...</think>`` blocks at the start.
 _LEADING_THINK_BLOCKS = re.compile(r"(?:<think>.*?</think>)+", re.DOTALL)
+
+# Stands for the arguments of a tool call with an id whose arguments are not JSON.
+# Canonical JSON never contains a raw NUL, so no parseable arguments hash the same.
+_UNPARSEABLE_ARGUMENTS = "\x00unparseable-json"
+# OpenCode (AI SDK tool-call repair) echoes a call whose arguments failed to parse as this tool,
+# with ``{"tool": <served name>, "error": "Invalid input for tool <name>: JSON parsing failed: ..."}``.
+_INVALID_TOOL_NAME = "invalid"
+_JSON_PARSE_ERROR = "JSON parsing failed"
 
 
 def assistant_fingerprint(messages: list[dict]) -> str:
@@ -254,34 +262,61 @@ def _tools_of(message: dict) -> list[tuple[str, str, str]]:
             # SSE separates these fields; the backend and echoed request sanitizer join them.
             # Preserve the namespace so different tools with the same short name cannot match.
             name = f"{message['namespace']}__{name}"
-        tools.append(
-            (
-                str(message.get("call_id") or message.get("id") or ""),
-                name,
-                canonicalize_tool_arguments(message.get("arguments")),
-            )
-        )
+        call_id = str(message.get("call_id") or message.get("id") or "")
+        tools.append(_tool_identity(call_id, name, message.get("arguments")))
     content = message.get("content")
     if isinstance(content, list):
         for block in content:
             if isinstance(block, dict) and block.get("type") == "tool_use":
-                tools.append(
-                    (
-                        str(block.get("id") or ""),
-                        str(block.get("name", "")),
-                        canonicalize_tool_arguments(block.get("input")),
-                    )
-                )
+                block_id = str(block.get("id") or "")
+                tools.append(_tool_identity(block_id, str(block.get("name", "")), block.get("input")))
     for call in message.get("tool_calls") or []:
         function = (call or {}).get("function") or {}
         tools.append(
-            (
-                str((call or {}).get("id") or ""),
-                str(function.get("name", "")),
-                canonicalize_tool_arguments(function.get("arguments")),
-            )
+            _tool_identity(str((call or {}).get("id") or ""), str(function.get("name", "")), function.get("arguments"))
         )
     return tools
+
+
+def _tool_identity(call_id: str, name: str, arguments: Any) -> tuple[str, str, str]:
+    """Return a tool call's ``(id, name, canonical arguments)`` for hashing.
+
+    A call with an id whose arguments are not JSON hashes a marker in place of its arguments.
+    A harness that cannot parse them need not echo them byte for byte to keep the call's lineage.
+    OpenCode echoes such a call as ``invalid`` with the served tool's name and the parse error.
+    That echo hashes as the call it repairs: same id, the named tool, the marker.
+    The id still identifies the served call; other ``invalid`` calls hash as they are.
+    """
+    if call_id and name == _INVALID_TOOL_NAME:
+        repaired = _repaired_tool_name(arguments)
+        if repaired is not None:
+            return call_id, repaired, _UNPARSEABLE_ARGUMENTS
+    if call_id and isinstance(arguments, str) and not _is_json(arguments):
+        return call_id, name, _UNPARSEABLE_ARGUMENTS
+    return call_id, name, canonicalize_tool_arguments(arguments)
+
+
+def _repaired_tool_name(arguments: Any) -> str | None:
+    """Return the tool an ``invalid`` echo stands for, if it reports a JSON parse failure."""
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(arguments, dict) or set(arguments) != {"tool", "error"}:
+        return None
+    tool, error = arguments["tool"], arguments["error"]
+    if not isinstance(tool, str) or not tool or not isinstance(error, str) or _JSON_PARSE_ERROR not in error:
+        return None
+    return tool
+
+
+def _is_json(value: str) -> bool:
+    try:
+        json.loads(value)
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 def _tool_results_of(message: dict) -> list[tuple[str, str]]:
