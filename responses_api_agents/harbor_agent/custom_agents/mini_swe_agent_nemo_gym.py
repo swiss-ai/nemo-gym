@@ -37,7 +37,7 @@ token usage) but no longer turns its ``bash`` blocks into tool calls.
 import json
 import shlex
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from harbor.agents.installed.base import with_prompt_template
 from harbor.agents.installed.mini_swe_agent import MiniSweAgent
@@ -47,6 +47,7 @@ from harbor.models.agent.context import AgentContext
 from responses_api_agents.harbor_agent.custom_agents.installed_compat import (
     ExecInput,
     drop_shared_kwargs,
+    kwargs_for_harbor_options,
     run_commands,
 )
 
@@ -65,6 +66,11 @@ SAMPLING_KEYS = {"temperature": "temperature", "top_p": "top_p", "max_output_tok
 
 
 class MiniSweAgentNemoGym(MiniSweAgent):
+    @classmethod
+    def preflight(cls, kwargs: dict[str, Any] | None = None, env: Mapping[str, str] | None = None) -> None:
+        # Harbor 0.25 checks the config's kwargs before any trial (Job.create); ours are taken by __init__
+        super().preflight(kwargs=kwargs_for_harbor_options(cls, kwargs), env=env)
+
     def __init__(
         self,
         *args: Any,

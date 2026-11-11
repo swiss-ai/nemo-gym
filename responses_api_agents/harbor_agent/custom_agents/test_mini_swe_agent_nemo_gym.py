@@ -244,3 +244,23 @@ def test_run_command_in_bash_loads_the_model_class(tmp_path: Path) -> None:
     assert third == {"limit": "CallLimitReached: Model call limit reached (2)."}
     assert result["cost"] == 0.0
     assert (logs / "agent" / "mini-swe-agent.txt").read_text() == res.stdout
+
+
+# Harbor 0.25's Job.create validates the config's kwargs with cls.preflight before any trial exists
+# (harbor job.py _preflight_agents); see the OpenCode test of the same name (job 5329860).
+def test_preflight_accepts_the_kwargs_harbor_agent_passes() -> None:
+    kwargs = {
+        "api_base": "http://127.0.0.1:8000/v1",
+        "responses_create_params": {"temperature": 1.0},
+        "temperature": 1.0,
+        "max_turns": 50,
+        "interleaved_thinking": True,
+        "model_info": {"max_input_tokens": 16384},
+        "version": "8e8a515fdcecf3a8e45c3909f7f196bfe18ca89a",
+    }
+    MiniSweAgentNemoGym.preflight(kwargs=kwargs, env={})
+
+
+def test_preflight_still_rejects_an_unknown_option() -> None:
+    with pytest.raises(ValueError, match="Unknown option 'not_an_option'"):
+        MiniSweAgentNemoGym.preflight(kwargs={"api_base": "http://127.0.0.1:8000/v1", "not_an_option": 1}, env={})

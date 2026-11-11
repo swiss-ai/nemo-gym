@@ -468,3 +468,29 @@ def test_writes_no_atif_trajectory(tmp_path: Path) -> None:
     _agent(tmp_path).populate_context_post_run(context)
     assert not (tmp_path / "trajectory.json").exists()
     assert context.is_empty()
+
+
+# Harbor 0.25's Job.create runs AgentFactory.run_preflight -> cls.preflight -> cls.parse_options on the
+# config's kwargs before any trial exists (harbor job.py _preflight_agents). Job 5329860: every kwarg was
+# "Unknown option" there, so no trial ran and every rollout came back empty.
+def test_preflight_accepts_the_kwargs_harbor_agent_passes() -> None:
+    kwargs = {
+        "api_base": API_BASE,
+        "responses_create_params": {"temperature": 1.0},
+        "temperature": 1.0,
+        "max_turns": 50,
+        "interleaved_thinking": True,
+        "model_info": {"max_input_tokens": 16384},
+        "opencode_config": {"share": "disabled"},
+        "opencode_install": "binary",
+        "opencode_timeout_sec": 870,
+        "opencode_debug": False,
+        "opencode_workdir": "/app",
+        "version": "1.17.11",
+    }
+    OpenCodeNemoGym.preflight(kwargs=kwargs, env={})
+
+
+def test_preflight_still_rejects_an_unknown_option() -> None:
+    with pytest.raises(ValueError, match="Unknown option 'not_an_option'"):
+        OpenCodeNemoGym.preflight(kwargs={"api_base": API_BASE, "not_an_option": 1}, env={})

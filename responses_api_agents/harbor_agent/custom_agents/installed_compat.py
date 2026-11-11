@@ -30,6 +30,7 @@ Harbor 0.1.x ignored them. harbor_agent passes the same kwargs to every agent (a
 ``harbor_agent_kwargs`` carry options other agents do not have; see ``drop_shared_kwargs``.
 """
 
+import inspect
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
@@ -47,6 +48,22 @@ def drop_shared_kwargs(kwargs: dict[str, Any], keep: Iterable[str] = ()) -> dict
     """``kwargs`` without the SHARED_AGENT_KWARGS this agent does not use (``keep`` lists those it does)."""
     unused = set(SHARED_AGENT_KWARGS) - set(keep)
     return {key: value for key, value in kwargs.items() if key not in unused}
+
+
+def kwargs_for_harbor_options(agent_cls: type, kwargs: dict[str, Any] | None) -> dict[str, Any]:
+    """``kwargs`` without the ones ``agent_cls.__init__`` takes itself and the SHARED_AGENT_KWARGS.
+
+    Harbor 0.25's Job.create validates each agent config's kwargs against the agent's ``options_model``
+    before any trial exists (job.py ``_preflight_agents`` -> agents/base.py ``preflight`` ->
+    ``parse_options``). Our adapters consume their own kwargs in ``__init__`` and pass the rest on, so their
+    ``preflight`` must hand Harbor only that rest; otherwise every one of them is an "Unknown option".
+    """
+    own = {
+        name
+        for name, param in inspect.signature(agent_cls.__init__).parameters.items()
+        if param.kind in (param.KEYWORD_ONLY, param.POSITIONAL_OR_KEYWORD) and name != "self"
+    }
+    return {key: value for key, value in drop_shared_kwargs(dict(kwargs or {})).items() if key not in own}
 
 
 class ExecInput(BaseModel):

@@ -44,7 +44,7 @@ import json
 import re
 import shlex
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from harbor.agents.installed.base import with_prompt_template
 from harbor.agents.installed.opencode import OpenCode
@@ -55,6 +55,7 @@ from responses_api_agents.harbor_agent.custom_agents.installed_compat import (
     ExecInput,
     drop_shared_kwargs,
     install_from_template,
+    kwargs_for_harbor_options,
     run_commands,
 )
 
@@ -111,6 +112,11 @@ def deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
 
 
 class OpenCodeNemoGym(OpenCode):
+    @classmethod
+    def preflight(cls, kwargs: dict[str, Any] | None = None, env: Mapping[str, str] | None = None) -> None:
+        # Harbor 0.25 checks the config's kwargs before any trial (Job.create); ours are taken by __init__
+        super().preflight(kwargs=kwargs_for_harbor_options(cls, kwargs), env=env)
+
     def __init__(
         self,
         *args: Any,
