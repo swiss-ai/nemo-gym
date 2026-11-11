@@ -2520,3 +2520,18 @@ async def test_shared_memory_metadata_reaches_create_api(fake_opensandbox_sdk, s
     provider = OpenSandboxProvider(attribution={"enabled": False}, probe={"command": None})
     await provider.create(SandboxSpec(image="image:tag", metadata={"nemo.nvidia.com/shm": size}))
     assert FakeSandbox.created_kwargs["metadata"]["nemo.nvidia.com/shm"] == size
+
+
+def test_provider_options_image_auth_file(tmp_path) -> None:
+    options_cls = opensandbox_provider.OpenSandboxProviderOptions
+    cred = tmp_path / "cred"
+    cred.write_text(f"user:{TEST_REGISTRY_PASSWORD}\n")
+    parsed = options_cls.from_mapping({"image_auth_file": str(cred)})
+    assert parsed.image_auth == {"username": "user", "password": TEST_REGISTRY_PASSWORD}
+    assert TEST_REGISTRY_PASSWORD not in repr(parsed)
+
+    with pytest.raises(ValueError, match="exclusive"):
+        options_cls.from_mapping({"image_auth_file": str(cred), "image_auth": {"username": "u", "password": "p"}})
+    cred.write_text("no-colon\n")
+    with pytest.raises(ValueError, match="username:password"):
+        options_cls.from_mapping({"image_auth_file": str(cred)})

@@ -633,9 +633,14 @@ class OpenSandboxProviderOptions:
 
     ``image_auth``, ``network_policy``, ``platform``, and ``volumes`` entries are passed through to the
     OpenSandbox SDK, so their inner fields are validated by the SDK rather than here.
+
+    ``image_auth_file`` names a file holding ``username:password`` for the image registry, read
+    when the options are parsed, so that the password stays out of configs (NeMo-RL prints the
+    resolved one) and the job's environment. It becomes ``image_auth``; giving both is an error.
     """
 
-    image_auth: Mapping[str, Any] | None = None
+    image_auth: Mapping[str, Any] | None = field(default=None, repr=False)
+    image_auth_file: str | None = None
     network_policy: Mapping[str, Any] | None = None
     platform: Mapping[str, Any] | None = None
     snapshot_id: str | None = None
@@ -670,6 +675,14 @@ class OpenSandboxProviderOptions:
         image_auth = options.get("image_auth")
         if image_auth is not None and not isinstance(image_auth, Mapping):
             raise TypeError("OpenSandbox provider option 'image_auth' must be a mapping")
+        image_auth_file = options.get("image_auth_file")
+        if image_auth_file is not None:
+            if image_auth is not None:
+                raise ValueError("OpenSandbox provider options 'image_auth' and 'image_auth_file' are exclusive")
+            username, sep, password = Path(image_auth_file).read_text().strip().partition(":")
+            if not sep or not username or not password:
+                raise ValueError(f"OpenSandbox image_auth_file {image_auth_file} must hold 'username:password'")
+            image_auth = {"username": username, "password": password}
         network_policy = options.get("network_policy")
         if network_policy is not None and not isinstance(network_policy, Mapping):
             raise TypeError("OpenSandbox provider option 'network_policy' must be a mapping")
@@ -698,6 +711,7 @@ class OpenSandboxProviderOptions:
 
         return cls(
             image_auth=dict(image_auth) if image_auth is not None else None,
+            image_auth_file=image_auth_file,
             network_policy=dict(network_policy) if network_policy is not None else None,
             platform=dict(platform) if platform is not None else None,
             snapshot_id=snapshot_id,
