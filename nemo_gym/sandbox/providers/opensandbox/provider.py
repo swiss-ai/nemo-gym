@@ -450,10 +450,13 @@ class OpenSandboxConnectionConfig:
     ``domain`` on its own, but the provider reads ``protocol`` directly, hence
     the normalization here. Only ``scheme://host[:port][/path-prefix]`` is
     accepted: a query string or fragment is a configuration error.
+    ``api_key_file`` names a file holding the key, read when ``api_key`` is
+    unset, so that the key itself stays out of configs and the environment.
     """
 
     domain: str | None = None
-    api_key: str | None = None
+    api_key: str | None = field(default=None, repr=False)
+    api_key_file: str | None = None
     protocol: str | None = None
     request_timeout_s: int | None = None
     use_server_proxy: bool = False
@@ -469,6 +472,8 @@ class OpenSandboxConnectionConfig:
     tls_verify: bool = False
 
     def __post_init__(self) -> None:
+        if self.api_key is None and self.api_key_file is not None:
+            self.api_key = Path(self.api_key_file).read_text().strip()
         if self.domain is None:
             return
         self.domain, scheme = split_domain_scheme(self.domain)

@@ -471,6 +471,28 @@ def test_cli_uses_standalone_connection_config_and_forwards_return_codes(
     assert "OpenSandbox cleanup failed: down" in capsys.readouterr().err
 
 
+def test_cli_reads_api_key_file_from_connection_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    key_file = tmp_path / "key"
+    key_file.write_text(f"{TEST_ACCESS_KEY}\n")
+    config = tmp_path / "env.yaml"
+    config.write_text(
+        "sandbox:\n"
+        "  opensandbox:\n"
+        "    connection:\n"
+        "      domain: https://sandbox.example\n"
+        f"      api_key_file: {key_file}\n"
+    )
+    calls = []
+
+    async def record_cleanup(**kwargs: object) -> int:
+        calls.append(kwargs)
+        return 0
+
+    monkeypatch.setattr(cleanup_sandboxes, "cleanup_sandboxes", record_cleanup)
+    assert cleanup_sandboxes.main(["--connection-config", str(config), "--run-id", "job-7", "--user", "alice"]) == 0
+    assert calls[0]["access_key"] == TEST_ACCESS_KEY
+
+
 @pytest.mark.parametrize(
     ("config", "message"),
     [

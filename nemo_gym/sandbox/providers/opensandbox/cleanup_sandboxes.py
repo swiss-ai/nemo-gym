@@ -174,7 +174,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--connection-config",
-        help="YAML file containing sandbox.opensandbox.connection, as an alternative to --domain/--api-key.",
+        help="YAML file containing sandbox.opensandbox.connection (api_key or api_key_file), as an alternative to --domain/--api-key.",
     )
     parser.add_argument("--domain", help="OpenSandbox domain, host or full URL.")
     parser.add_argument("--api-key", help="OpenSandbox access key.")
@@ -224,6 +224,9 @@ def main(argv: list[str] | None = None) -> int:
 
         domain = connection.get("domain")
         access_key = connection.get("api_key")
+        if not access_key and connection.get("api_key_file"):
+            with open(connection["api_key_file"], encoding="utf-8") as key_file:
+                access_key = key_file.read().strip()
         protocol = connection.get("protocol") or "http"
         for path, value in (("domain", domain), ("api_key", access_key)):
             if not isinstance(value, str) or not value.strip():

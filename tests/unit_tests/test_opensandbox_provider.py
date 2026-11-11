@@ -826,6 +826,22 @@ def test_connection_config_and_image_policy(fake_opensandbox_sdk: None) -> None:
     assert "headers" not in direct._connection_config().kwargs
 
 
+def test_connection_api_key_file(fake_opensandbox_sdk: None, tmp_path: Path) -> None:
+    key_file = tmp_path / "key"
+    key_file.write_text("file-key\n")  # pragma: allowlist secret
+    provider = opensandbox_provider.OpenSandboxProvider(
+        connection={"domain": "sandbox.example", "api_key_file": str(key_file), "use_server_proxy": True}
+    )
+    assert provider._connection_config().kwargs["api_key"] == "file-key"  # pragma: allowlist secret
+    assert "file-key" not in repr(provider._connection)
+
+    # An explicit api_key wins over the file.
+    provider = opensandbox_provider.OpenSandboxProvider(
+        connection={"api_key": "inline-key", "api_key_file": str(key_file)}  # pragma: allowlist secret
+    )
+    assert provider._connection.api_key == "inline-key"  # pragma: allowlist secret
+
+
 def test_connection_transport_backends(fake_opensandbox_sdk: None) -> None:
     from nemo_gym.sandbox.providers._http_transport import GymAiohttpTransport
 
