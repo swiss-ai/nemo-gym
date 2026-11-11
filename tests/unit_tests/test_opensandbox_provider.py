@@ -17,6 +17,7 @@ import asyncio
 import builtins
 import gc
 import logging
+import sys
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -2535,3 +2536,103 @@ def test_provider_options_image_auth_file(tmp_path) -> None:
     cred.write_text("no-colon\n")
     with pytest.raises(ValueError, match="username:password"):
         options_cls.from_mapping({"image_auth_file": str(cred)})
+
+
+ROBOT_NAME = "robot$swe_lego_v05_1+puller"
+ROBOT_PASSWORD = "pw:with:colons"  # pragma: allowlist secret
+
+
+@dataclass
+class FakeImageAuth:
+    username: str
+    password: str
+
+
+@dataclass
+class FakeImageSpec:
+    image: str
+    auth: FakeImageAuth | None = None
+
+
+@pytest.fixture
+def fake_image_models(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The SDK's image models, so these tests run without the opensandbox package."""
+    models = SimpleNamespace(SandboxImageAuth=FakeImageAuth, SandboxImageSpec=FakeImageSpec)
+    monkeypatch.setitem(sys.modules, "opensandbox", SimpleNamespace(models=SimpleNamespace(sandboxes=models)))
+    monkeypatch.setitem(sys.modules, "opensandbox.models", SimpleNamespace(sandboxes=models))
+    monkeypatch.setitem(sys.modules, "opensandbox.models.sandboxes", models)
+
+
+async def test_image_auth_registry_limits_credentials_to_that_registry(
+    fake_opensandbox_sdk: None, fake_image_models: None, tmp_path: Path
+) -> None:
+    cred = tmp_path / "registry_cred"
+    cred.write_text(f"{ROBOT_NAME}:{ROBOT_PASSWORD}\n")
+    options = {"image_auth_file": str(cred), "image_auth_registry": "rl-registry.example"}
+    provider = opensandbox_provider.OpenSandboxProvider(probe={"command": None})
+
+    # Docker Hub (no host in the reference, or docker.io) and another registry: no credentials sent
+    for other in ("python:3.12-slim", "docker.io/library/python:3.12-slim", "mirror.gcr.io/astral/uv:latest"):
+        await provider.create(SandboxSpec(image=other, provider_options=options))
+        assert FakeSandbox.created_kwargs["image"] == other
+
+    await provider.create(SandboxSpec(image="rl-registry.example/swe_lego_v05_1/task:1", provider_options=options))
+    image = FakeSandbox.created_kwargs["image"]
+    assert (image.auth.username, image.auth.password) == (ROBOT_NAME, ROBOT_PASSWORD)
+
+
+async def test_image_auth_registry_with_inline_credentials(
+    fake_opensandbox_sdk: None, fake_image_models: None
+) -> None:
+    options = {
+        "image_auth": {"username": "user", "password": TEST_REGISTRY_PASSWORD},
+        "image_auth_registry": "Registry.Example:5000",
+    }
+    provider = opensandbox_provider.OpenSandboxProvider(probe={"command": None})
+
+    await provider.create(SandboxSpec(image="python:3.12-slim", provider_options=options))
+    assert FakeSandbox.created_kwargs["image"] == "python:3.12-slim"
+    # same host, other port: another registry
+    await provider.create(SandboxSpec(image="registry.example/repo", provider_options=options))
+    assert FakeSandbox.created_kwargs["image"] == "registry.example/repo"
+    await provider.create(SandboxSpec(image="registry.example:5000/repo:tag", provider_options=options))
+    assert FakeSandbox.created_kwargs["image"].auth.password == TEST_REGISTRY_PASSWORD
+
+
+async def test_image_auth_without_registry_goes_to_every_registry(
+    fake_opensandbox_sdk: None, fake_image_models: None
+) -> None:
+    options = {"image_auth": {"username": "user", "password": TEST_REGISTRY_PASSWORD}}
+    provider = opensandbox_provider.OpenSandboxProvider(probe={"command": None})
+    await provider.create(SandboxSpec(image="python:3.12-slim", provider_options=options))
+    assert FakeSandbox.created_kwargs["image"].auth.username == "user"
+
+
+@pytest.mark.parametrize(
+    "image, registry",
+    [
+        ("python:3.12-slim", "docker.io"),
+        ("library/python", "docker.io"),
+        ("docker.io/library/python:3.12", "docker.io"),
+        ("localhost/repo:tag", "localhost"),
+        ("localhost:5000/repo", "localhost:5000"),
+        ("Registry.Example/repo@sha256:abc", "registry.example"),
+    ],
+)
+def test_image_registry(image: str, registry: str) -> None:
+    assert opensandbox_provider._image_registry(image) == registry
+
+
+def test_provider_options_image_auth_registry(tmp_path: Path) -> None:
+    options_cls = opensandbox_provider.OpenSandboxProviderOptions
+    cred = tmp_path / "cred"
+    cred.write_text(f"{ROBOT_NAME}:{ROBOT_PASSWORD}\n")
+    parsed = options_cls.from_mapping({"image_auth_file": str(cred), "image_auth_registry": "rl-registry.example"})
+    assert parsed.image_auth_registry == "rl-registry.example"
+    assert ROBOT_PASSWORD not in repr(parsed)
+
+    with pytest.raises(ValueError, match="needs image_auth or image_auth_file"):
+        options_cls.from_mapping({"image_auth_registry": "rl-registry.example"})
+    for bad in ("", "rl-registry.example/project", 5):
+        with pytest.raises(TypeError, match="registry host"):
+            options_cls.from_mapping({"image_auth_file": str(cred), "image_auth_registry": bad})
