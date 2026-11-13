@@ -353,7 +353,8 @@ class HarborAgent(SimpleResponsesAPIAgent):
                 usage = HarborAgentUtils.extract_usage(trial_result, trajectory)
 
             except Exception as e:
-                print(f"Error running Harbor job: {e}")
+                # stderr, flushed: buffered stdout is lost when the server is killed at shutdown
+                print(f"Error running Harbor job: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
                 trial_result = None
                 trajectory = None
                 agent_error_flags = {}

@@ -447,6 +447,17 @@ class TestApp:
         assert response.responses_create_params.temperature == 0.3
         assert response.responses_create_params.input == []
 
+    async def test_run_failed_execution_reports_the_error_at_once(self, capsys):
+        # jobs 5329860/5330618: the error went to buffered stdout and was lost when the server was killed, so the
+        # driver log showed empty rollouts without a cause
+        server = _make_server()
+        with _harbor_run_mocks(side_effect=ValueError("Invalid kwargs for agent 'x': Unknown option 'y'.")):
+            await server.run(_make_run_request(instance_id="scientific::fail_task"))
+
+        err = capsys.readouterr().err
+        assert "Error running Harbor job" in err
+        assert "ValueError: Invalid kwargs for agent 'x': Unknown option 'y'." in err
+
     @pytest.mark.parametrize(
         "model_name, expected",
         [
