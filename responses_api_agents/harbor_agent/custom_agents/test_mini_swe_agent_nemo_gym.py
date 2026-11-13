@@ -264,3 +264,14 @@ def test_preflight_accepts_the_kwargs_harbor_agent_passes() -> None:
 def test_preflight_still_rejects_an_unknown_option() -> None:
     with pytest.raises(ValueError, match="Unknown option 'not_an_option'"):
         MiniSweAgentNemoGym.preflight(kwargs={"api_base": "http://127.0.0.1:8000/v1", "not_an_option": 1}, env={})
+
+
+def test_preflight_accepts_the_training_yaml_kwargs() -> None:
+    # job 5330618: Gym's training yaml gives every agent its Terminus-2-only kwargs (see the OpenCode test)
+    from omegaconf import OmegaConf
+
+    path = Path(__file__).parents[1] / "configs" / "harbor_agent_opensandbox_training.yaml"
+    cfg = OmegaConf.to_container(OmegaConf.load(path), resolve=False)
+    kwargs = dict(cfg["harbor_agent"]["responses_api_agents"]["harbor_agent"]["harbor_agent_kwargs"])
+    kwargs.update(api_base="http://127.0.0.1:8000/v1", version="8e8a515fdcecf3a8e45c3909f7f196bfe18ca89a")
+    MiniSweAgentNemoGym.preflight(kwargs=kwargs, env={})

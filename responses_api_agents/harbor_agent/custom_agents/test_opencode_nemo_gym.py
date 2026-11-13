@@ -494,3 +494,34 @@ def test_preflight_accepts_the_kwargs_harbor_agent_passes() -> None:
 def test_preflight_still_rejects_an_unknown_option() -> None:
     with pytest.raises(ValueError, match="Unknown option 'not_an_option'"):
         OpenCodeNemoGym.preflight(kwargs={"api_base": API_BASE, "not_an_option": 1}, env={})
+
+
+# Job 5330618: Gym's harbor_agent_opensandbox_training.yaml (a config_paths entry of every run) sets Terminus-2-only
+# kwargs; an OpenCode overlay merged on top cannot delete them (OmegaConf), so OpenCode gets them too and Harbor 0.25
+# rejected them as unknown options, in Job.create's preflight and again in BaseAgent.__init__.
+def _training_yaml_kwargs() -> dict:
+    from omegaconf import OmegaConf
+
+    path = Path(__file__).parents[1] / "configs" / "harbor_agent_opensandbox_training.yaml"
+    cfg = OmegaConf.to_container(OmegaConf.load(path), resolve=False)
+    return cfg["harbor_agent"]["responses_api_agents"]["harbor_agent"]["harbor_agent_kwargs"]
+
+
+def _training_yaml_plus_opencode() -> dict:
+    return {
+        **_training_yaml_kwargs(),
+        "api_base": API_BASE,
+        "responses_create_params": {"temperature": 1.0},
+        "temperature": 1.0,
+        "opencode_install": "binary",
+        "opencode_workdir": "/app",
+        "version": "1.17.11",
+    }
+
+
+def test_preflight_accepts_the_training_yaml_kwargs() -> None:
+    OpenCodeNemoGym.preflight(kwargs=_training_yaml_plus_opencode(), env={})
+
+
+def test_init_accepts_the_training_yaml_kwargs(tmp_path: Path) -> None:
+    OpenCodeNemoGym(logs_dir=tmp_path, model_name=MODEL, **_training_yaml_plus_opencode())

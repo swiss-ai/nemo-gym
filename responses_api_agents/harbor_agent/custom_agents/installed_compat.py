@@ -40,8 +40,20 @@ from jinja2 import Environment
 from pydantic import BaseModel
 
 
-# kwargs that harbor_agent or the shared Terminus-2 harbor_agent_kwargs give to whichever agent runs
-SHARED_AGENT_KWARGS = ("responses_create_params", "temperature", "interleaved_thinking", "max_turns", "model_info")
+# kwargs that harbor_agent or the shared Terminus-2 harbor_agent_kwargs give to whichever agent runs. The last four
+# are Terminus-2 options from Gym's configs/harbor_agent_opensandbox_training.yaml, which every run loads; an agent
+# overlay merged on top cannot delete them (OmegaConf), so OpenCode and mini get them too (job 5330618).
+SHARED_AGENT_KWARGS = (
+    "responses_create_params",
+    "temperature",
+    "interleaved_thinking",
+    "max_turns",
+    "model_info",
+    "enable_summarize",
+    "collect_rollout_details",
+    "trajectory_config",
+    "nemo_model_server_timeout_sec",
+)
 
 
 def drop_shared_kwargs(kwargs: dict[str, Any], keep: Iterable[str] = ()) -> dict[str, Any]:
