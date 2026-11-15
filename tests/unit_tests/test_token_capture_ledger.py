@@ -250,6 +250,47 @@ async def test_admission_match_uses_staging_chain_without_wire_prefix(store):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("first_reply", [ASSISTANT_1, {"role": "assistant", "content": ""}])
+async def test_a_call_after_an_empty_reply_resolves_to_the_call_that_produced_it(store, first_reply):
+    """An empty reply is a turn: its call must not share a fingerprint with its parent (job 5256202).
+
+    Terminus-2 answers an empty model reply with a "parsing errors" user turn and
+    echoes the empty assistant turn back. Before the fix both c1 and c2 matched c3's
+    request and c3 was poisoned as ``unresolved_parent``.
+    """
+    retry = {"role": "user", "content": "Previous response had parsing errors"}
+    empty_served = {"type": "message", "role": "assistant", "content": ""}
+    empty_echoed = {"role": "assistant", "content": ""}
+    await store.record(_commit(_call_record("c1"), [USER_1], [first_reply], staging_chain=("r1/c1",)))
+    tokens_2 = TOKENS_1 + [901, 902]
+    await store.record(
+        _commit(
+            _call_record(
+                "c2",
+                parent_call_id="c1",
+                prev_len=len(TOKENS_1),
+                delta_len=2,
+                chain_hash=compute_chain_hash(CHAIN_HASH_1, [901, 902]),
+                cumulative_hash=hash_token_ids(tokens_2),
+            ),
+            [USER_1, first_reply, retry],
+            [empty_served],
+            staging_chain=("r1/c1", "r1/c2"),
+        )
+    )
+
+    context = await _admit(store, [USER_1, first_reply, retry, empty_echoed, retry], model_call_id="c3")
+
+    admission = context.capture_admission
+    assert admission is not None
+    assert admission.parent_call_id == "c2"
+    assert admission.prev_len == len(tokens_2)
+    # c1's own continuation is still unique and still resolves to c1.
+    resolution = await store.resolve("r1", [USER_1, first_reply, retry])
+    assert resolution.match is not None and resolution.match.model_call_id == "c1"
+
+
+@pytest.mark.asyncio
 async def test_staging_chain_grows_across_external_calls(store):
     await _record_call_1(store)
     tokens_2 = TOKENS_1 + [901, 902]

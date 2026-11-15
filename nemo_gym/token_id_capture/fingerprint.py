@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from typing import Any
 
 import orjson
@@ -45,11 +46,22 @@ import orjson
 
 # Increment when fingerprint canonicalization or hash layout changes.
 # Resolvers ignore entries stamped with a different version.
-FINGERPRINT_VERSION = 3
+FINGERPRINT_VERSION = 6
 
 _FINGERPRINT_DOMAIN = b"nemo-gym-lineage"
 _CONTEXT_DOMAIN = b"nemo-gym-lineage-context"
 _INSTRUCTION_ROLES = frozenset({"system", "developer"})
+
+# The reasoning that a model server folds into assistant text: one or more ``<think>...</think>`` blocks at the start.
+_LEADING_THINK_BLOCKS = re.compile(r"(?:<think>.*?</think>)+", re.DOTALL)
+
+# Stands for the arguments of a tool call with an id whose arguments are not JSON.
+# Canonical JSON never contains a raw NUL, so no parseable arguments hash the same.
+_UNPARSEABLE_ARGUMENTS = "\x00unparseable-json"
+# OpenCode (AI SDK tool-call repair) echoes a call whose arguments failed to parse as this tool,
+# with ``{"tool": <served name>, "error": "Invalid input for tool <name>: JSON parsing failed: ..."}``.
+_INVALID_TOOL_NAME = "invalid"
+_JSON_PARSE_ERROR = "JSON parsing failed"
 
 
 def assistant_fingerprint(messages: list[dict]) -> str:
@@ -58,22 +70,48 @@ def assistant_fingerprint(messages: list[dict]) -> str:
     The fingerprint identifies the call that produced the last model-authored turn.
     User and tool content is excluded from the lookup key.
     Dialect-specific tool-call shapes normalize to the same hash input.
+
+    A turn is a run of consecutive model-authored items.
+    A turn with no text and no tool call (an empty reply) hashes an explicit marker.
+    Without it, the call that produced an empty reply would share its parent's fingerprint.
+    The next request would then match both calls and resolve as ambiguous.
+    Non-empty turns hash exactly as before, so their fingerprints do not change.
+
+    Reasoning folded into assistant text is excluded like standalone reasoning items.
+    A server with a reasoning parser returns ``<think>REASONING</think>`` + content.
+    A harness may echo that text verbatim or only the content after the block.
+    Both echoes must find the call, so leading think blocks are stripped before hashing.
+    A turn left with no text and no tool call hashes the empty-turn marker.
     """
     hasher = hashlib.sha256(_FINGERPRINT_DOMAIN)
     count = 0
+    # Whether the current run of consecutive model-authored items hashed any field.
+    # ``None`` means no run is open.
+    run_hashed: bool | None = None
     for message in messages or []:
         if not isinstance(message, dict):
             raise ValueError(f"request item is not an object: {type(message).__name__}")
         if not _is_assistant_authored(message):
+            if message.get("type") == "reasoning":
+                # Excluded like reasoning content; it neither opens nor closes a turn.
+                continue
+            if run_hashed is False:
+                _update_field(hasher, b"\x05", "")
+            run_hashed = None
             continue
         count += 1
-        for content_type, payload in _content_of(message.get("content")):
+        run_hashed = bool(run_hashed)
+        for content_type, payload in _strip_leading_reasoning(_content_of(message.get("content"))):
             _update_field(hasher, b"\x00", content_type)
             _update_field(hasher, b"\x01", payload)
+            run_hashed = True
         for call_id, name, arguments in _tools_of(message):
             _update_field(hasher, b"\x02", call_id)
             _update_field(hasher, b"\x03", name)
             _update_field(hasher, b"\x04", arguments)
+            run_hashed = True
+    if run_hashed is False:
+        _update_field(hasher, b"\x05", "")
     if count == 0:
         return ""
     return hasher.hexdigest()
@@ -192,6 +230,23 @@ def _content_of(content: Any) -> list[tuple[str, str]]:
     return parts
 
 
+def _strip_leading_reasoning(parts: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Drop the think blocks that open a model-authored item's text.
+
+    ``_wrap_reasoning_in_think_tags`` puts reasoning only at the start of the content.
+    Clients that split it back out (LiteLLM) take one leading block and keep the rest verbatim.
+    Stripping the whole leading run makes both echoes agree, even when the visible text starts with a block.
+    Think blocks later in the text are visible model output and stay hashed.
+    """
+    if not parts or parts[0][0] != "text":
+        return parts
+    match = _LEADING_THINK_BLOCKS.match(parts[0][1])
+    if match is None:
+        return parts
+    rest = parts[0][1][match.end() :]
+    return ([("text", rest)] if rest else []) + parts[1:]
+
+
 def _tools_of(message: dict) -> list[tuple[str, str, str]]:
     """Return tool calls as ``(id, name, canonical arguments)`` tuples.
 
@@ -207,34 +262,61 @@ def _tools_of(message: dict) -> list[tuple[str, str, str]]:
             # SSE separates these fields; the backend and echoed request sanitizer join them.
             # Preserve the namespace so different tools with the same short name cannot match.
             name = f"{message['namespace']}__{name}"
-        tools.append(
-            (
-                str(message.get("call_id") or message.get("id") or ""),
-                name,
-                canonicalize_tool_arguments(message.get("arguments")),
-            )
-        )
+        call_id = str(message.get("call_id") or message.get("id") or "")
+        tools.append(_tool_identity(call_id, name, message.get("arguments")))
     content = message.get("content")
     if isinstance(content, list):
         for block in content:
             if isinstance(block, dict) and block.get("type") == "tool_use":
-                tools.append(
-                    (
-                        str(block.get("id") or ""),
-                        str(block.get("name", "")),
-                        canonicalize_tool_arguments(block.get("input")),
-                    )
-                )
+                block_id = str(block.get("id") or "")
+                tools.append(_tool_identity(block_id, str(block.get("name", "")), block.get("input")))
     for call in message.get("tool_calls") or []:
         function = (call or {}).get("function") or {}
         tools.append(
-            (
-                str((call or {}).get("id") or ""),
-                str(function.get("name", "")),
-                canonicalize_tool_arguments(function.get("arguments")),
-            )
+            _tool_identity(str((call or {}).get("id") or ""), str(function.get("name", "")), function.get("arguments"))
         )
     return tools
+
+
+def _tool_identity(call_id: str, name: str, arguments: Any) -> tuple[str, str, str]:
+    """Return a tool call's ``(id, name, canonical arguments)`` for hashing.
+
+    A call with an id whose arguments are not JSON hashes a marker in place of its arguments.
+    A harness that cannot parse them need not echo them byte for byte to keep the call's lineage.
+    OpenCode echoes such a call as ``invalid`` with the served tool's name and the parse error.
+    That echo hashes as the call it repairs: same id, the named tool, the marker.
+    The id still identifies the served call; other ``invalid`` calls hash as they are.
+    """
+    if call_id and name == _INVALID_TOOL_NAME:
+        repaired = _repaired_tool_name(arguments)
+        if repaired is not None:
+            return call_id, repaired, _UNPARSEABLE_ARGUMENTS
+    if call_id and isinstance(arguments, str) and not _is_json(arguments):
+        return call_id, name, _UNPARSEABLE_ARGUMENTS
+    return call_id, name, canonicalize_tool_arguments(arguments)
+
+
+def _repaired_tool_name(arguments: Any) -> str | None:
+    """Return the tool an ``invalid`` echo stands for, if it reports a JSON parse failure."""
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(arguments, dict) or set(arguments) != {"tool", "error"}:
+        return None
+    tool, error = arguments["tool"], arguments["error"]
+    if not isinstance(tool, str) or not tool or not isinstance(error, str) or _JSON_PARSE_ERROR not in error:
+        return None
+    return tool
+
+
+def _is_json(value: str) -> bool:
+    try:
+        json.loads(value)
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 def _tool_results_of(message: dict) -> list[tuple[str, str]]:
