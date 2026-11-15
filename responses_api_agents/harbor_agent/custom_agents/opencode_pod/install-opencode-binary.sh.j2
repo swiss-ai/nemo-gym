@@ -1,0 +1,66 @@
+#!/bin/bash
+# Installs the standalone OpenCode binary (Bun-compiled, no Node/npm) from its GitHub release.
+# Rendered by OpenCodeNemoGym (opencode_install: binary); url, sha256 and install_dir arrive
+# shell-quoted. Needs python3 (task images such as python:3.12-slim have no curl) or curl, and tar.
+set -euo pipefail
+
+version={{ version }}
+url={{ url }}
+sha256={{ sha256 }}
+install_dir={{ install_dir }}
+dest="$install_dir/opencode"
+
+if [ -x "$dest" ] && [ "$("$dest" --version 2>/dev/null || true)" = "$version" ]; then
+  echo "opencode $version already installed at $dest"
+  exit 0
+fi
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+archive="$work/opencode.tar.gz"
+
+if command -v python3 >/dev/null 2>&1; then
+  python3 - "$url" "$archive" "$sha256" <<'PY'
+import hashlib
+import sys
+import time
+import urllib.request
+
+url, out, want = sys.argv[1:4]
+for attempt in range(1, 4):
+    try:
+        digest = hashlib.sha256()
+        with urllib.request.urlopen(url, timeout=120) as response, open(out, "wb") as f:
+            while chunk := response.read(1 << 20):
+                f.write(chunk)
+                digest.update(chunk)
+        break
+    except Exception as e:  # network errors: retry, then fail the setup
+        if attempt == 3:
+            sys.exit(f"download of {url} failed: {e}")
+        print(f"download attempt {attempt} failed: {e}", file=sys.stderr)
+        time.sleep(5 * attempt)
+got = digest.hexdigest()
+print(f"downloaded {url} sha256 {got}")
+if want and got != want:
+    sys.exit(f"sha256 mismatch for {url}: expected {want}, got {got}")
+PY
+elif command -v curl >/dev/null 2>&1; then
+  curl -fsSL --retry 3 -o "$archive" "$url"
+  if [ -n "$sha256" ]; then
+    echo "$sha256  $archive" | sha256sum -c -
+  fi
+else
+  echo "installing opencode needs python3 or curl in the task image" >&2
+  exit 1
+fi
+
+tar -xzf "$archive" -C "$work" opencode
+mkdir -p "$install_dir"
+install -m 755 "$work/opencode" "$dest"
+actual=$("$dest" --version)
+if [ "$actual" != "$version" ]; then
+  echo "opencode version mismatch: wanted $version, $dest --version printed $actual" >&2
+  exit 1
+fi
+echo "installed opencode $actual at $dest"

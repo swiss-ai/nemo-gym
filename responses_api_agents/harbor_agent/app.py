@@ -20,6 +20,7 @@ from asyncio import Semaphore
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 import ray
@@ -105,6 +106,9 @@ class HarborAgentConfig(BaseResponsesAPIAgentConfig):
     harbor_verifier_max_timeout: Optional[int] = None
     # Multiplier applied to all Harbor timeouts after override/cap. None = 1.0.
     harbor_timeout_multiplier: Optional[float] = None
+    # Also mask rollouts whose agent hit its timeout (AgentTimeoutError), even when the verifier
+    # ran. Off by default: such a rollout then trains with the verifier's reward.
+    harbor_mask_agent_timeout: bool = False
 
     # --- Job output ---
     # Directory where Harbor writes job results and trial artifacts.
@@ -116,6 +120,12 @@ class HarborAgentConfig(BaseResponsesAPIAgentConfig):
     # --- Model routing ---
     # NeMo Gym model server reference used to resolve Harbor model base URL.
     model_server: ModelServerRef
+    # Root URL (without "/v1") under which the Harbor agent reaches that model server. Defaults to
+    # http://<host>:<port> of `model_server`. Set it when the agent's model calls originate somewhere
+    # that cannot reach that address, e.g. an installed agent running inside a remote sandbox that
+    # reaches the model server only through a proxy. The rollout's capture prefix
+    # (/ng-rollout/<id>[/training-token-capture]) is appended to it either way.
+    harbor_model_base_url: Optional[str] = None
 
 
 class HarborRunRequest(BaseRunRequest):
@@ -125,6 +135,11 @@ class HarborRunRequest(BaseRunRequest):
 
 class HarborVerifyResponse(BaseVerifyResponse):
     model_config = ConfigDict(extra="allow")
+
+
+def _exception_type(trial_result: Optional[dict]) -> Optional[str]:
+    """Harbor's exception_info.exception_type of a trial result dict (e.g. "AgentTimeoutError")."""
+    return ((trial_result or {}).get("exception_info") or {}).get("exception_type")
 
 
 def _find_trial_dir_with_result(job_dir: Path) -> Optional[Path]:
@@ -276,7 +291,8 @@ class HarborAgent(SimpleResponsesAPIAgent):
             global_config_dict = get_global_config_dict()
 
             policy_model_name = global_config_dict["policy_model_name"]
-            base_url = self._resolve_model_base_url(global_config_dict)
+            base_url = self._resolve_model_base_url(global_config_dict, body)
+            model_tunnel = self._model_tunnel_kwargs(global_config_dict)
             run_timestamp = datetime.now(timezone.utc)
             run_id = self._build_run_id(run_timestamp)
 
@@ -300,6 +316,7 @@ class HarborAgent(SimpleResponsesAPIAgent):
                 job_name=job_name,
                 jobs_dir=jobs_dir,
                 responses_create_params=responses_create_params,
+                model_tunnel=model_tunnel,
             )
 
             try:
@@ -344,7 +361,8 @@ class HarborAgent(SimpleResponsesAPIAgent):
                 usage = HarborAgentUtils.extract_usage(trial_result, trajectory)
 
             except Exception as e:
-                print(f"Error running Harbor job: {e}")
+                # stderr, flushed: buffered stdout is lost when the server is killed at shutdown
+                print(f"Error running Harbor job: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
                 trial_result = None
                 trajectory = None
                 agent_error_flags = {}
@@ -380,12 +398,10 @@ class HarborAgent(SimpleResponsesAPIAgent):
                 # the trainer can drop it from the gradient instead; NeMo-RL
                 # reads this exact path (instance_config.mask_sample), which is
                 # also how anyswe_agent reports sandbox failures.
-                instance_config={"mask_sample": not output_items},
+                instance_config={"mask_sample": self._should_mask(trial_result, output_items)},
                 context_length_exceeded_error=int(agent_error_flags.get("context_length_exceeded", False)),
                 memory_limit_exceeded_error=int(agent_error_flags.get("memory_limit_exceeded", False)),
-                agent_timeout_error=int(
-                    ((trial_result or {}).get("exception_info") or {}).get("exception_type") == "AgentTimeoutError"
-                ),
+                agent_timeout_error=int(_exception_type(trial_result) == "AgentTimeoutError"),
             )
 
             # Save result to disk (folder = run_id, file = task name)
@@ -448,14 +464,52 @@ class HarborAgent(SimpleResponsesAPIAgent):
         sanitized = sanitized.strip("._")
         return sanitized or "unknown"
 
-    def _resolve_model_base_url(self, global_config_dict: Any) -> str:
-        """Resolve model base URL from required model_server reference."""
-        server_name = self.config.model_server.name
-        model_server_config = get_first_server_config_dict(
-            global_config_dict,
-            server_name,
-        )
-        return f"http://{model_server_config['host']}:{model_server_config['port']}/v1"
+    def _should_mask(self, trial_result: Optional[dict], output_items: list) -> bool:
+        """Whether the trainer should drop this rollout from the gradient.
+
+        Without training-token capture the tokens come from the output items, so a rollout without
+        any is untrainable. With capture the model server holds the tokens and rebuilds the rollout
+        (and masks it itself when no call chain was captured); agents such as OpenCode write no ATIF
+        trajectory at all, so empty output is expected there. The rollout is still masked when the
+        trial failed or the verifier never produced a result, since its reward then means nothing.
+        With `harbor_mask_agent_timeout`, a trial that ended in AgentTimeoutError is masked as well.
+        """
+        if self.config.harbor_mask_agent_timeout and _exception_type(trial_result) == "AgentTimeoutError":
+            return True
+        if not self._token_id_capture_enabled():
+            return not output_items
+        return trial_result is None or not trial_result.get("verifier_result")
+
+    def _resolve_model_base_url(self, global_config_dict: Any, body: Optional[HarborRunRequest] = None) -> str:
+        """Resolve the model base URL handed to the Harbor agent.
+
+        The root is `harbor_model_base_url` or the model_server's host:port. When model-call or
+        training-token capture is enabled, the run's rollout prefix is inserted before "/v1" so
+        the model server can attribute every call of this rollout (see base_url_for_run).
+        """
+        if self.config.harbor_model_base_url:
+            root = self.config.harbor_model_base_url.rstrip("/").removesuffix("/v1")
+        else:
+            root = self._model_server_root(global_config_dict)
+        return f"{self.base_url_for_run(root, body)}/v1"
+
+    def _model_server_root(self, global_config_dict: Any) -> str:
+        model_server_config = get_first_server_config_dict(global_config_dict, self.config.model_server.name)
+        return f"http://{model_server_config['host']}:{model_server_config['port']}"
+
+    def _model_tunnel_kwargs(self, global_config_dict: Any) -> Optional[dict[str, Any]]:
+        """``harbor_environment_kwargs.model_tunnel`` with ``target`` defaulted to the model server.
+
+        The model server's port is only known at run time, so the environment (which opens the tunnel
+        from the Harbor process to that host:port) gets it from here.
+        """
+        raw = (self.config.harbor_environment_kwargs or {}).get("model_tunnel")
+        if not raw:
+            return None
+        tunnel = dict(raw)
+        if not tunnel.get("target"):
+            tunnel["target"] = urlsplit(self._model_server_root(global_config_dict)).netloc
+        return tunnel
 
     def _build_job_config(
         self,
@@ -466,6 +520,7 @@ class HarborAgent(SimpleResponsesAPIAgent):
         job_name: str,
         jobs_dir: Path,
         responses_create_params: Optional[dict[str, Any]] = None,
+        model_tunnel: Optional[dict[str, Any]] = None,
     ) -> dict:
         """Build a Harbor JobConfig dict for a single task."""
         from harbor.models.job.config import (
@@ -525,6 +580,9 @@ class HarborAgent(SimpleResponsesAPIAgent):
         # Dataset alias-level workdir overrides global harbor_environment_kwargs.workdir.
         if dataset_source.workdir is not None:
             environment_kwargs["workdir"] = dataset_source.workdir
+        # resolved per run (target = model server), replaces the static copy from harbor_environment_kwargs
+        if model_tunnel is not None:
+            environment_kwargs["model_tunnel"] = model_tunnel
 
         environment_config = EnvironmentConfig(
             type=self.config.harbor_environment_type if not self.config.harbor_environment_import_path else None,

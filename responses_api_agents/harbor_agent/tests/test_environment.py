@@ -107,7 +107,7 @@ def _make_environment(tmp_path: Path, *, task_env_config: Optional[TaskEnvironme
     return NemoGymSandboxEnvironment(
         environment_dir=tmp_path / "task" / "environment",
         environment_name="example-task",
-        session_id="example-task__trial-1",
+        session_id=defaults.pop("session_id", "example-task__trial-1"),
         trial_paths=TrialPaths(trial_dir=trial_dir),
         task_env_config=task_env_config
         or TaskEnvironmentConfig(docker_image="docker.io/example/task:1.0", cpus=4, memory_mb=8192),
@@ -538,3 +538,94 @@ class TestBaseEnvironmentSignatureDrift:
             f"{drifted}. Add them (forwarding to the sandbox client) or harbor will "
             "raise TypeError at rollout time."
         )
+
+
+class _RecordingTunnel:
+    instances: list["_RecordingTunnel"] = []
+    fail_open = False
+
+    def __init__(self, sandbox, config, logger, label=""):
+        self.sandbox, self.config, self.label = sandbox, config, label
+        self.opened = self.closed = False
+        _RecordingTunnel.instances.append(self)
+
+    async def open(self):
+        if _RecordingTunnel.fail_open:
+            raise RuntimeError("tunnel down")
+        self.opened = True
+
+    async def close(self):
+        self.closed = True
+
+
+class TestModelTunnel:
+    @pytest.fixture(autouse=True)
+    def _patch_tunnel(self, monkeypatch):
+        from responses_api_agents.harbor_agent.custom_envs.nemo_gym_sandbox import environment as env_module
+
+        _RecordingTunnel.instances.clear()
+        _RecordingTunnel.fail_open = False
+        monkeypatch.setattr(env_module, "ModelTunnel", _RecordingTunnel)
+
+    def test_rejects_unknown_tunnel_keys_at_construction(self, tmp_path):
+        with pytest.raises(ValueError, match="Unknown model_tunnel keys"):
+            _make_environment(tmp_path, model_tunnel={"chisel_dir": "/c", "bogus": 1})
+
+    @pytest.mark.asyncio
+    async def test_no_tunnel_by_default(self, tmp_path):
+        env = _make_environment(tmp_path)
+        await env.start(force_build=False)
+        assert _provider().created_specs[0].ports == ()
+        assert _RecordingTunnel.instances == []
+
+    @pytest.mark.asyncio
+    async def test_tunnel_opens_after_start_and_closes_on_stop(self, tmp_path):
+        env = _make_environment(
+            tmp_path, model_tunnel={"chisel_dir": "/c", "target": "policy-host:9000", "server_port": 9999}
+        )
+        await env.start(force_build=False)
+        provider = _provider()
+        assert provider.created_specs[0].ports == (9999,)  # declared, so sandbox.endpoint() resolves it
+        (tunnel,) = _RecordingTunnel.instances
+        assert tunnel.opened and tunnel.config.target == "policy-host:9000"
+        assert "example-task__trial-1" in tunnel.label
+
+        await env.stop(delete=True)
+        assert tunnel.closed and provider.closed_handles == ["sbx-123"]
+
+    @pytest.mark.asyncio
+    async def test_agent_environment_opens_tunnel(self, tmp_path):
+        # Harbor's session id for the agent's environment (trial.py: f"{trial_name}__env")
+        env = _make_environment(
+            tmp_path, session_id="example-task__AbCdEfG__env", model_tunnel={"chisel_dir": "/c", "target": "h:1"}
+        )
+        assert env.is_separate_verifier_environment is False
+        await env.start(force_build=False)
+        assert [t.opened for t in _RecordingTunnel.instances] == [True]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "session_id",
+        ["example-task__AbCdEfG__verifier__trial", "a-long-task-name__AbCdEfG__verifier__a-long-ste__0123abcd"],
+    )
+    async def test_separate_verifier_environment_gets_no_tunnel(self, tmp_path, session_id):
+        # Harbor builds a separate verifier's environment from the same environment kwargs and names it
+        # f"{trial_name}__verifier__{key}" (hash-suffixed when long); only the agent calls the model.
+        env = _make_environment(
+            tmp_path, session_id=session_id, model_tunnel={"chisel_dir": "/c", "target": "h:1", "server_port": 9999}
+        )
+        assert env.is_separate_verifier_environment is True
+        await env.start(force_build=False)
+        assert _provider().created_specs[0].ports == ()
+        assert _RecordingTunnel.instances == []
+        await env.stop(delete=True)
+        assert _provider().closed_handles == ["sbx-123"]
+
+    @pytest.mark.asyncio
+    async def test_failed_tunnel_fails_start_and_stop_still_deletes_sandbox(self, tmp_path):
+        _RecordingTunnel.fail_open = True
+        env = _make_environment(tmp_path, model_tunnel={"chisel_dir": "/c", "target": "h:1"})
+        with pytest.raises(RuntimeError, match="tunnel down"):
+            await env.start(force_build=False)
+        await env.stop(delete=True)
+        assert _provider().closed_handles == ["sbx-123"]

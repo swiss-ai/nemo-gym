@@ -447,6 +447,17 @@ class TestApp:
         assert response.responses_create_params.temperature == 0.3
         assert response.responses_create_params.input == []
 
+    async def test_run_failed_execution_reports_the_error_at_once(self, capsys):
+        # jobs 5329860/5330618: the error went to buffered stdout and was lost when the server was killed, so the
+        # driver log showed empty rollouts without a cause
+        server = _make_server()
+        with _harbor_run_mocks(side_effect=ValueError("Invalid kwargs for agent 'x': Unknown option 'y'.")):
+            await server.run(_make_run_request(instance_id="scientific::fail_task"))
+
+        err = capsys.readouterr().err
+        assert "Error running Harbor job" in err
+        assert "ValueError: Invalid kwargs for agent 'x': Unknown option 'y'." in err
+
     @pytest.mark.parametrize(
         "model_name, expected",
         [
@@ -469,6 +480,118 @@ class TestApp:
         assert server._get_jobs_output_dir("deepseek-ai/DeepSeek-V3.2", "scientific", ts).parts[-1] == "DeepSeek-V3.2"
         assert server._get_jobs_output_dir("deepseek-ai/DeepSeek-V3.2", "scientific", ts).parts[-3] == "20260210"
         assert server._get_results_output_dir("my-plain-model", "scientific", ts).parts[-1] == "my-plain-model"
+
+    def test_model_base_url_without_capture_is_plain(self) -> None:
+        server = _make_server()
+        server.server_client.global_config_dict = {}
+        body = HarborRunRequest.model_validate(
+            {"instance_id": "scientific::t", "responses_create_params": {"input": []}, "_ng_rollout_id": "3-1"}
+        )
+        assert server._resolve_model_base_url(_GLOBAL_CONFIG, body) == "http://policy-host:9000/v1"
+        assert server._resolve_model_base_url(_GLOBAL_CONFIG) == "http://policy-host:9000/v1"
+
+    def test_model_base_url_with_training_capture_carries_rollout_prefix(self) -> None:
+        server = _make_server(token_id_capture=True)
+        server.server_client.global_config_dict = {"token_id_capture": {"enabled": True}}
+        body = HarborRunRequest.model_validate(
+            {"instance_id": "scientific::t", "responses_create_params": {"input": []}, "_ng_rollout_id": "3-1"}
+        )
+        assert (
+            server._resolve_model_base_url(_GLOBAL_CONFIG, body)
+            == "http://policy-host:9000/ng-rollout/3-1/training-token-capture/v1"
+        )
+
+    def test_mask_without_capture_follows_output_items(self) -> None:
+        server = _make_server()
+        server.server_client.global_config_dict = {}
+        verified = {"verifier_result": {"rewards": {"reward": 1.0}}}
+        assert server._should_mask(verified, []) is True
+        assert server._should_mask(verified, [{"type": "message"}]) is False
+
+    def test_mask_with_capture_ignores_empty_output_but_not_failed_trials(self) -> None:
+        server = _make_server(token_id_capture=True)
+        server.server_client.global_config_dict = {"token_id_capture": {"enabled": True}}
+        verified = {"verifier_result": {"rewards": {"reward": 0.0}}}
+        # OpenCode writes no ATIF: empty output, tokens come from the capture ledger
+        assert server._should_mask(verified, []) is False
+        # run() fell into its except branch
+        assert server._should_mask(None, []) is True
+        # trial ended without a verifier result (setup or agent crash)
+        assert server._should_mask({"verifier_result": None}, [{"type": "message"}]) is True
+        # an agent timeout with a verifier result trains by default
+        timed_out = {**verified, "exception_info": {"exception_type": "AgentTimeoutError"}}
+        assert server._should_mask(timed_out, []) is False
+
+    @pytest.mark.parametrize("token_id_capture", [False, True])
+    def test_mask_agent_timeout_is_opt_in(self, token_id_capture: bool) -> None:
+        server = _make_server(token_id_capture=token_id_capture, harbor_mask_agent_timeout=True)
+        server.server_client.global_config_dict = {"token_id_capture": {"enabled": token_id_capture}}
+        verified = {"verifier_result": {"rewards": {"reward": 1.0}}}
+        timed_out = {**verified, "exception_info": {"exception_type": "AgentTimeoutError"}}
+        other_error = {**verified, "exception_info": {"exception_type": "NonZeroAgentExitCodeError"}}
+        output = [{"type": "message"}]
+        assert server._should_mask(timed_out, output) is True
+        assert server._should_mask(other_error, output) is False
+        assert server._should_mask(verified, output) is False
+
+    def test_model_base_url_capture_needs_agent_opt_in(self) -> None:
+        server = _make_server()
+        server.server_client.global_config_dict = {"token_id_capture": {"enabled": True}}
+        body = HarborRunRequest.model_validate(
+            {"instance_id": "scientific::t", "responses_create_params": {"input": []}, "_ng_rollout_id": "3-1"}
+        )
+        assert server._resolve_model_base_url(_GLOBAL_CONFIG, body) == "http://policy-host:9000/v1"
+
+    @pytest.mark.parametrize(
+        "override",
+        ["https://proxy.example.org/gym", "https://proxy.example.org/gym/", "https://proxy.example.org/gym/v1"],
+    )
+    def test_model_base_url_override_keeps_capture_prefix(self, override: str) -> None:
+        server = _make_server(token_id_capture=True, harbor_model_base_url=override)
+        server.server_client.global_config_dict = {"token_id_capture": {"enabled": True}}
+        body = HarborRunRequest.model_validate(
+            {"instance_id": "scientific::t", "responses_create_params": {"input": []}, "_ng_rollout_id": "3-1"}
+        )
+        assert (
+            server._resolve_model_base_url(_GLOBAL_CONFIG, body)
+            == "https://proxy.example.org/gym/ng-rollout/3-1/training-token-capture/v1"
+        )
+
+    def test_model_tunnel_kwargs_absent_without_config(self) -> None:
+        assert _make_server()._model_tunnel_kwargs(_GLOBAL_CONFIG) is None
+        server = _make_server(harbor_environment_kwargs={"workdir": "/w"})
+        assert server._model_tunnel_kwargs(_GLOBAL_CONFIG) is None
+
+    def test_model_tunnel_target_defaults_to_model_server(self) -> None:
+        server = _make_server(harbor_environment_kwargs={"model_tunnel": {"chisel_dir": "/c", "pod_port": 8001}})
+        assert server._model_tunnel_kwargs(_GLOBAL_CONFIG) == {
+            "chisel_dir": "/c",
+            "pod_port": 8001,
+            "target": "policy-host:9000",
+        }
+        # the config itself is not mutated (it is shared by all runs)
+        assert "target" not in server.config.harbor_environment_kwargs["model_tunnel"]
+
+    def test_model_tunnel_explicit_target_wins(self) -> None:
+        server = _make_server(harbor_environment_kwargs={"model_tunnel": {"chisel_dir": "/c", "target": "gw:1"}})
+        assert server._model_tunnel_kwargs(_GLOBAL_CONFIG)["target"] == "gw:1"
+
+    def test_build_job_config_passes_resolved_model_tunnel(self) -> None:
+        pytest.importorskip("harbor")
+        server = _make_server(harbor_environment_kwargs={"model_tunnel": {"chisel_dir": "/c"}, "workdir": "/w"})
+        config = server._build_job_config(
+            dataset_alias="scientific",
+            task_name="test_task_123",
+            model_name="test_model",
+            api_base="http://policy-host:9000/v1",
+            job_name="test_job",
+            jobs_dir=Path("/tmp/harbor_jobs"),
+            model_tunnel={"chisel_dir": "/c", "target": "policy-host:9000"},
+        )
+        assert config["environment"]["kwargs"]["model_tunnel"] == {"chisel_dir": "/c", "target": "policy-host:9000"}
+        assert config["environment"]["kwargs"]["workdir"] == "/w"
+        # Terminus-2 keeps calling the model from the node
+        assert config["agents"][0]["kwargs"]["api_base"] == "http://policy-host:9000/v1"
 
     def test_build_job_config_uses_daytona_type_when_import_path_is_clear(self) -> None:
         pytest.importorskip("harbor")
