@@ -274,4 +274,6 @@ def test_preflight_accepts_the_training_yaml_kwargs() -> None:
     cfg = OmegaConf.to_container(OmegaConf.load(path), resolve=False)
     kwargs = dict(cfg["harbor_agent"]["responses_api_agents"]["harbor_agent"]["harbor_agent_kwargs"])
     kwargs.update(api_base="http://127.0.0.1:8000/v1", version="8e8a515fdcecf3a8e45c3909f7f196bfe18ca89a")
+    # a Terminus-2 option an env yaml may set (Terminus2NemoGym's cap on truncation re-asks)
+    kwargs.update(max_consecutive_truncations=8)
     MiniSweAgentNemoGym.preflight(kwargs=kwargs, env={})

@@ -510,6 +510,8 @@ def _training_yaml_kwargs() -> dict:
 def _training_yaml_plus_opencode() -> dict:
     return {
         **_training_yaml_kwargs(),
+        # a Terminus-2 option an env yaml may set (Terminus2NemoGym's cap on truncation re-asks)
+        "max_consecutive_truncations": 8,
         "api_base": API_BASE,
         "responses_create_params": {"temperature": 1.0},
         "temperature": 1.0,

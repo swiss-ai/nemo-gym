@@ -18,7 +18,7 @@ from typing import Any, Literal
 
 from harbor.agents.terminus_2.terminus_2 import Terminus2, Terminus2Options
 from harbor.environments.base import BaseEnvironment
-from harbor.llms.base import BaseLLM
+from harbor.llms.base import BaseLLM, LLMResponse
 from harbor.models.agent.context import AgentContext
 from pydantic import Field
 
@@ -26,8 +26,12 @@ from responses_api_agents.harbor_agent.custom_agents.llms.nemo_gym_llm import Ne
 from responses_api_agents.harbor_agent.custom_envs.singularity.singularity import MemoryLimitExceededError
 
 
+class TruncationLoopError(RuntimeError):
+    """Too many consecutive replies hit the output limit with nothing salvageable; ends the episode."""
+
+
 class Terminus2NemoGymOptions(Terminus2Options):
-    """Terminus2's options plus the two this subclass adds.
+    """Terminus2's options plus the three this subclass adds.
 
     harbor >=0.20 validates agent kwargs against ``options_model`` rather than
     the constructor signature, and AgentOptions sets ``extra="forbid"``, so a
@@ -42,6 +46,12 @@ class Terminus2NemoGymOptions(Terminus2Options):
     nemo_model_server_timeout_sec: float = Field(
         default=120.0,
         description="Per-request timeout for the NeMo Gym model server.",
+    )
+    max_consecutive_truncations: int | None = Field(
+        default=8,
+        ge=1,
+        description="End the episode after this many consecutive replies that hit the output limit with nothing "
+        "salvageable (Terminus2 re-asks without bound). None: no limit.",
     )
 
 
@@ -101,6 +111,8 @@ class Terminus2NemoGym(Terminus2):
         # builds its own backend by calling self._init_llm() from __init__.
         # Stash the instance first so the override below can hand it back.
         self._injected_llm = llm
+        self._truncation_depth = 0
+        self._truncation_limit_hit = False
 
         super().__init__(
             logs_dir=logs_dir,
@@ -135,6 +147,33 @@ class Terminus2NemoGym(Terminus2):
         argument by keyword and has changed the set across releases.
         """
         return self._injected_llm
+
+    async def _query_llm(self, chat, prompt, original_instruction="", session=None):
+        """Terminus2._query_llm with a bound on its re-asks after unsalvageable truncations.
+
+        On a reply that hit the output limit with nothing salvageable, Terminus2._query_llm appends it plus
+        "ERROR!! NONE of the actions ..." and calls itself (this method) again, with no limit; jobs 5350472 and
+        5355345 looped ~320 times until Python's recursion limit. That is the only place it recurses, so the
+        nesting depth here is the number of consecutive such replies. At the limit no model call is made: a
+        placeholder unwinds the chain without an exception (one raised inside it would be retried by each
+        level's @retry), and the outermost call, outside @retry, raises TruncationLoopError, which run() turns
+        into a normal end of the episode, so the verifier still runs.
+        """
+        limit = self.options.max_consecutive_truncations
+        if limit is not None and self._truncation_depth >= limit:
+            self._truncation_limit_hit = True
+            return LLMResponse(content="")
+        self._truncation_depth += 1
+        try:
+            response = await super()._query_llm(chat, prompt, original_instruction, session)
+        finally:
+            self._truncation_depth -= 1
+        if self._truncation_depth == 0 and self._truncation_limit_hit:
+            self._truncation_limit_hit = False
+            raise TruncationLoopError(
+                f"{limit} consecutive replies hit the output limit with nothing salvageable; ending the episode"
+            )
+        return response
 
     async def run(self, instruction: str, environment: BaseEnvironment, context: AgentContext) -> None:
         """Override run() to gracefully handle agent errors.
