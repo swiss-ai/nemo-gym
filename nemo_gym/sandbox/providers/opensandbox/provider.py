@@ -380,8 +380,19 @@ def _to_volumes(volumes: list[Mapping[str, Any]]) -> list[Any]:
     return [Volume(**dict(volume)) for volume in volumes]
 
 
-def _to_image_spec(image: str, image_auth: Mapping[str, Any] | None) -> Any:
+def _image_registry(image: str) -> str:
+    """The registry host of an image reference, ``docker.io`` when it names none (as the OpenSandbox server)."""
+    first, sep, _ = image.partition("/")
+    if sep and ("." in first or ":" in first or first == "localhost"):
+        return first.lower()
+    return "docker.io"
+
+
+def _to_image_spec(image: str, image_auth: Mapping[str, Any] | None, registry: str | None = None) -> Any:
+    """Image spec with pull credentials; with ``registry`` only for images from that registry host."""
     if image_auth is None:
+        return image
+    if registry is not None and _image_registry(image) != registry.lower():
         return image
     from opensandbox.models.sandboxes import SandboxImageAuth, SandboxImageSpec
 
@@ -450,10 +461,13 @@ class OpenSandboxConnectionConfig:
     ``domain`` on its own, but the provider reads ``protocol`` directly, hence
     the normalization here. Only ``scheme://host[:port][/path-prefix]`` is
     accepted: a query string or fragment is a configuration error.
+    ``api_key_file`` names a file holding the key, read when ``api_key`` is
+    unset, so that the key itself stays out of configs and the environment.
     """
 
     domain: str | None = None
-    api_key: str | None = None
+    api_key: str | None = field(default=None, repr=False)
+    api_key_file: str | None = None
     protocol: str | None = None
     request_timeout_s: int | None = None
     use_server_proxy: bool = False
@@ -469,6 +483,8 @@ class OpenSandboxConnectionConfig:
     tls_verify: bool = False
 
     def __post_init__(self) -> None:
+        if self.api_key is None and self.api_key_file is not None:
+            self.api_key = Path(self.api_key_file).read_text().strip()
         if self.domain is None:
             return
         self.domain, scheme = split_domain_scheme(self.domain)
@@ -628,9 +644,20 @@ class OpenSandboxProviderOptions:
 
     ``image_auth``, ``network_policy``, ``platform``, and ``volumes`` entries are passed through to the
     OpenSandbox SDK, so their inner fields are validated by the SDK rather than here.
+
+    ``image_auth_file`` names a file holding ``username:password`` for the image registry, read
+    when the options are parsed, so that the password stays out of configs (NeMo-RL prints the
+    resolved one) and the job's environment. It becomes ``image_auth``; giving both is an error.
+
+    ``image_auth_registry`` (a registry host, e.g. ``registry.example:5000``) limits ``image_auth`` to
+    images from that registry; others are pulled without credentials. The OpenSandbox server builds the
+    pull secret for whatever registry each image names, so without it the credentials also go to Docker
+    Hub for ``python:3.12-slim``. A reference without a host is a Docker Hub image (``docker.io``).
     """
 
-    image_auth: Mapping[str, Any] | None = None
+    image_auth: Mapping[str, Any] | None = field(default=None, repr=False)
+    image_auth_file: str | None = None
+    image_auth_registry: str | None = None
     network_policy: Mapping[str, Any] | None = None
     platform: Mapping[str, Any] | None = None
     snapshot_id: str | None = None
@@ -665,6 +692,22 @@ class OpenSandboxProviderOptions:
         image_auth = options.get("image_auth")
         if image_auth is not None and not isinstance(image_auth, Mapping):
             raise TypeError("OpenSandbox provider option 'image_auth' must be a mapping")
+        image_auth_file = options.get("image_auth_file")
+        if image_auth_file is not None:
+            if image_auth is not None:
+                raise ValueError("OpenSandbox provider options 'image_auth' and 'image_auth_file' are exclusive")
+            username, sep, password = Path(image_auth_file).read_text().strip().partition(":")
+            if not sep or not username or not password:
+                raise ValueError(f"OpenSandbox image_auth_file {image_auth_file} must hold 'username:password'")
+            image_auth = {"username": username, "password": password}
+        image_auth_registry = options.get("image_auth_registry")
+        if image_auth_registry is not None:
+            if not isinstance(image_auth_registry, str) or not image_auth_registry or "/" in image_auth_registry:
+                raise TypeError("OpenSandbox provider option 'image_auth_registry' must be a registry host")
+            if image_auth is None:
+                raise ValueError(
+                    "OpenSandbox provider option 'image_auth_registry' needs image_auth or image_auth_file"
+                )
         network_policy = options.get("network_policy")
         if network_policy is not None and not isinstance(network_policy, Mapping):
             raise TypeError("OpenSandbox provider option 'network_policy' must be a mapping")
@@ -693,6 +736,8 @@ class OpenSandboxProviderOptions:
 
         return cls(
             image_auth=dict(image_auth) if image_auth is not None else None,
+            image_auth_file=image_auth_file,
+            image_auth_registry=image_auth_registry,
             network_policy=dict(network_policy) if network_policy is not None else None,
             platform=dict(platform) if platform is not None else None,
             snapshot_id=snapshot_id,
@@ -1520,7 +1565,7 @@ class OpenSandboxProvider:
         elif options.resource_requests is not None:
             kwargs["resource_requests"] = _resource_map(SandboxResources.from_mapping(options.resource_requests))
         if spec.image is not None:
-            kwargs["image"] = _to_image_spec(spec.image, options.image_auth)
+            kwargs["image"] = _to_image_spec(spec.image, options.image_auth, options.image_auth_registry)
         if options.snapshot_id is not None:
             kwargs["snapshot_id"] = options.snapshot_id
         if options.secure_access is not None:
